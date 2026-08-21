@@ -1,6 +1,7 @@
 package dev.companionremote.app
 
 import android.os.Bundle
+import android.content.Intent
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.viewModels
@@ -29,7 +30,6 @@ import dev.companionremote.app.ui.DeviceListScreen
 import dev.companionremote.app.ui.PairingScreen
 import dev.companionremote.app.ui.RemoteScreen
 import dev.companionremote.app.ui.SettingsScreen
-import dev.companionremote.app.ui.UpdateDialog
 
 class MainActivity : ComponentActivity() {
 
@@ -53,21 +53,38 @@ class MainActivity : ComponentActivity() {
                             is Screen.Remote -> RemoteScreen(viewModel, current.device)
                         }
                     }
-                    val updateState by viewModel.updateState.collectAsState()
-                    UpdateDialog(
-                        state = updateState,
-                        onDownload = viewModel::downloadUpdate,
-                        onInstall = viewModel::installUpdate,
-                        onDismiss = viewModel::dismissUpdate,
-                    )
                 }
             }
+        }
+        handleIntent(intent)
+    }
+
+    override fun onNewIntent(intent: Intent) {
+        super.onNewIntent(intent)
+        setIntent(intent)
+        handleIntent(intent)
+    }
+
+    private fun handleIntent(intent: Intent?) {
+        val token = intent?.getStringExtra(EXTRA_OPEN_LAST_REMOTE_TOKEN)
+        if (RemoteSessionManager.get(this).consumeOpenFullRemoteToken(token)) {
+            intent.removeExtra(EXTRA_OPEN_LAST_REMOTE_TOKEN)
+            viewModel.openLastRemote()
         }
     }
 
     override fun onStart() {
         super.onStart()
         viewModel.onForeground()
+    }
+
+    override fun onStop() {
+        viewModel.onBackground()
+        super.onStop()
+    }
+
+    companion object {
+        const val EXTRA_OPEN_LAST_REMOTE_TOKEN = "open_last_remote_token"
     }
 }
 

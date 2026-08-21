@@ -3,10 +3,13 @@ package dev.companionremote.app.data
 import android.content.Context
 import androidx.datastore.preferences.core.booleanPreferencesKey
 import androidx.datastore.preferences.core.edit
+import androidx.datastore.preferences.core.intPreferencesKey
 import androidx.datastore.preferences.core.stringPreferencesKey
 import androidx.datastore.preferences.preferencesDataStore
+import dev.companionremote.app.discovery.DiscoveredAtv
 import dev.companionremote.app.i18n.AppLanguage
 import kotlinx.coroutines.flow.Flow
+import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.map
 
 private val Context.settingsDataStore by preferencesDataStore(name = "cyberremote_settings")
@@ -31,8 +34,9 @@ class SettingsRepository(context: Context) {
     private val hapticEnabledKey = booleanPreferencesKey("haptic_enabled")
     private val hapticStrengthKey = stringPreferencesKey("haptic_strength")
     private val introSeenKey = booleanPreferencesKey("intro_seen")
-    private val autoCheckUpdatesKey = booleanPreferencesKey("auto_check_updates")
-    private val autoDownloadUpdatesKey = booleanPreferencesKey("auto_download_updates")
+    private val lastDeviceNameKey = stringPreferencesKey("last_device_name")
+    private val lastDeviceHostKey = stringPreferencesKey("last_device_host")
+    private val lastDevicePortKey = intPreferencesKey("last_device_port")
 
     val language: Flow<AppLanguage> = appContext.settingsDataStore.data.map { prefs ->
         when (prefs[languageKey]) {
@@ -80,16 +84,6 @@ class SettingsRepository(context: Context) {
     /** Whether the first-run remote tutorial has been shown. */
     val introSeen: Flow<Boolean> = appContext.settingsDataStore.data.map { prefs ->
         prefs[introSeenKey] ?: false
-    }
-
-    /** Check GitHub for a newer APK on launch (default on). */
-    val autoCheckUpdates: Flow<Boolean> = appContext.settingsDataStore.data.map { prefs ->
-        prefs[autoCheckUpdatesKey] ?: true
-    }
-
-    /** Download an available update automatically (default off — save data). */
-    val autoDownloadUpdates: Flow<Boolean> = appContext.settingsDataStore.data.map { prefs ->
-        prefs[autoDownloadUpdatesKey] ?: false
     }
 
     suspend fun setLanguage(language: AppLanguage) {
@@ -145,11 +139,30 @@ class SettingsRepository(context: Context) {
         appContext.settingsDataStore.edit { prefs -> prefs[introSeenKey] = seen }
     }
 
-    suspend fun setAutoCheckUpdates(enabled: Boolean) {
-        appContext.settingsDataStore.edit { prefs -> prefs[autoCheckUpdatesKey] = enabled }
+    /** Last successfully connected device, including its cached Companion port. */
+    suspend fun lastDevice(): DiscoveredAtv? {
+        val prefs = appContext.settingsDataStore.data.first()
+        val name = prefs[lastDeviceNameKey] ?: return null
+        val host = prefs[lastDeviceHostKey] ?: return null
+        val port = prefs[lastDevicePortKey] ?: return null
+        return DiscoveredAtv(name = name, host = host, port = port, model = null)
     }
 
-    suspend fun setAutoDownloadUpdates(enabled: Boolean) {
-        appContext.settingsDataStore.edit { prefs -> prefs[autoDownloadUpdatesKey] = enabled }
+    suspend fun setLastDevice(device: DiscoveredAtv) {
+        appContext.settingsDataStore.edit { prefs ->
+            prefs[lastDeviceNameKey] = device.name
+            prefs[lastDeviceHostKey] = device.host
+            prefs[lastDevicePortKey] = device.port
+        }
+    }
+
+    suspend fun clearLastDeviceIf(name: String) {
+        appContext.settingsDataStore.edit { prefs ->
+            if (prefs[lastDeviceNameKey] == name) {
+                prefs.remove(lastDeviceNameKey)
+                prefs.remove(lastDeviceHostKey)
+                prefs.remove(lastDevicePortKey)
+            }
+        }
     }
 }

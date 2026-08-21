@@ -9,23 +9,11 @@ android {
     compileSdk = 35
 
     defaultConfig {
-        applicationId = "dev.companionremote.app"
+        applicationId = "dev.companionremote.nikita"
         minSdk = 26
         targetSdk = 35
-        versionCode = 3
-        versionName = "1.0.2"
-    }
-
-    val releaseKeystore = System.getenv("SIGNING_KEYSTORE_PATH")?.takeIf { it.isNotBlank() }
-    signingConfigs {
-        create("release") {
-            if (releaseKeystore != null) {
-                storeFile = file(releaseKeystore)
-                storePassword = System.getenv("SIGNING_STORE_PASSWORD")
-                keyAlias = System.getenv("SIGNING_KEY_ALIAS")
-                keyPassword = System.getenv("SIGNING_KEY_PASSWORD")
-            }
-        }
+        versionCode = 4
+        versionName = "1.1.0-qs"
     }
 
     buildTypes {
@@ -36,13 +24,9 @@ android {
                 getDefaultProguardFile("proguard-android-optimize.txt"),
                 "proguard-rules.pro",
             )
-            // Fall back to the debug key so assembleRelease always produces
-            // an installable APK; CI injects the real keystore via env.
-            signingConfig = if (releaseKeystore != null) {
-                signingConfigs.getByName("release")
-            } else {
-                signingConfigs.getByName("debug")
-            }
+            // CI intentionally emits an unsigned release APK. Distribution is
+            // signed afterward with the fork owner's persistent private key;
+            // never fall back to Android's disposable debug certificate.
         }
     }
 

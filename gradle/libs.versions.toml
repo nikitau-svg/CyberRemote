@@ -1,7 +1,7 @@
 [versions]
 kotlin = "2.1.20"
 coroutines = "1.10.2"
-bouncycastle = "1.80"
+bouncycastle = "1.85"
 junit = "5.11.4"
 jmdns = "3.5.12"
 agp = "8.7.3"

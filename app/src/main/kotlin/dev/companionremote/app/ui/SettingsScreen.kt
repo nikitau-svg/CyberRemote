@@ -1,5 +1,11 @@
 package dev.companionremote.app.ui
 
+import android.app.StatusBarManager
+import android.content.ComponentName
+import android.content.Context
+import android.graphics.drawable.Icon as AndroidIcon
+import android.os.Build
+import android.widget.Toast
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
@@ -49,6 +55,7 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalClipboardManager
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.ui.text.font.FontWeight
@@ -63,6 +70,7 @@ import dev.companionremote.app.i18n.AppLanguage
 import dev.companionremote.app.i18n.FEEDBACK_EMAIL
 import dev.companionremote.app.i18n.LocalAppStrings
 import dev.companionremote.app.theme.skinAccentPreview
+import dev.companionremote.app.quick.RemoteTileService
 import kotlinx.coroutines.launch
 
 @OptIn(ExperimentalMaterial3Api::class)
@@ -75,12 +83,11 @@ fun SettingsScreen(viewModel: AppViewModel) {
     val fetchIcons by viewModel.fetchAppIcons.collectAsState()
     val hapticEnabled by viewModel.hapticEnabled.collectAsState()
     val hapticStrength by viewModel.hapticStrength.collectAsState()
-    val autoCheckUpdates by viewModel.autoCheckUpdates.collectAsState()
-    val autoDownloadUpdates by viewModel.autoDownloadUpdates.collectAsState()
     val paired by viewModel.pairedDevices.collectAsState()
     val activeDevice by viewModel.activeDeviceName.collectAsState()
     val deviceVerify by viewModel.deviceVerify.collectAsState()
     val clipboard = LocalClipboardManager.current
+    val context = LocalContext.current
     val snackbarHostState = remember { SnackbarHostState() }
     val scope = rememberCoroutineScope()
     val previewHaptic = rememberHapticPreview()
@@ -213,6 +220,34 @@ fun SettingsScreen(viewModel: AppViewModel) {
                 }
             }
 
+            // Quick Settings tile
+            SectionTitle("Quick Settings")
+            SettingsCard {
+                Row(
+                    Modifier.fillMaxWidth().clickable { requestRemoteTile(context) }.padding(16.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    Box(
+                        Modifier.size(40.dp).background(MaterialTheme.colorScheme.primaryContainer, CircleShape),
+                        contentAlignment = Alignment.Center,
+                    ) {
+                        Icon(
+                            Icons.Rounded.Tv,
+                            contentDescription = null,
+                            tint = MaterialTheme.colorScheme.onPrimaryContainer,
+                        )
+                    }
+                    Column(Modifier.padding(start = 16.dp).weight(1f)) {
+                        Text("Add Apple TV tile", style = MaterialTheme.typography.bodyLarge, fontWeight = FontWeight.Medium)
+                        Text(
+                            "Open the compact remote and persistent shade controls.",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        )
+                    }
+                }
+            }
+
             // Feedback
             SectionTitle(s.sendFeedback)
             SettingsCard {
@@ -245,37 +280,6 @@ fun SettingsScreen(viewModel: AppViewModel) {
                 }
             }
 
-            // Updates
-            SectionTitle(s.updates)
-            SettingsCard {
-                ToggleRow(
-                    title = s.autoCheckUpdates,
-                    desc = s.autoCheckUpdatesDesc,
-                    checked = autoCheckUpdates,
-                    onCheckedChange = { viewModel.setAutoCheckUpdates(it) },
-                )
-                ToggleRow(
-                    title = s.autoDownloadUpdates,
-                    desc = s.autoDownloadUpdatesDesc,
-                    checked = autoDownloadUpdates,
-                    onCheckedChange = { viewModel.setAutoDownloadUpdates(it) },
-                )
-                Row(
-                    Modifier.fillMaxWidth().clickable { viewModel.checkForUpdates(manual = true) }
-                        .padding(16.dp),
-                    verticalAlignment = Alignment.CenterVertically,
-                ) {
-                    Column(Modifier.weight(1f)) {
-                        Text(s.checkNow, style = MaterialTheme.typography.bodyLarge, fontWeight = FontWeight.Medium)
-                        Text(
-                            s.currentVersion.format(dev.companionremote.app.BuildConfig.VERSION_NAME),
-                            style = MaterialTheme.typography.bodySmall,
-                            color = MaterialTheme.colorScheme.onSurfaceVariant,
-                        )
-                    }
-                }
-            }
-
             // About
             SectionTitle(s.about)
             Text(
@@ -292,6 +296,24 @@ fun SettingsScreen(viewModel: AppViewModel) {
             )
             Spacer(Modifier.height(24.dp))
         }
+    }
+}
+
+private fun requestRemoteTile(context: Context) {
+    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+        val manager = context.getSystemService(StatusBarManager::class.java)
+        manager.requestAddTileService(
+            ComponentName(context, RemoteTileService::class.java),
+            "Apple TV",
+            AndroidIcon.createWithResource(context, R.drawable.ic_qs_remote),
+            context.mainExecutor,
+        ) { result ->
+            if (result != StatusBarManager.TILE_ADD_REQUEST_RESULT_TILE_ADDED) {
+                Toast.makeText(context, "You can also add Apple TV from Edit tiles.", Toast.LENGTH_LONG).show()
+            }
+        }
+    } else {
+        Toast.makeText(context, "Pull down twice, tap Edit, then add Apple TV.", Toast.LENGTH_LONG).show()
     }
 }
 
