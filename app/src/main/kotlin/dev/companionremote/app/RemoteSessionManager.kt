@@ -170,7 +170,9 @@ class RemoteSessionManager private constructor(context: Context) {
         }
 
     fun queueTouch(x: Long, y: Long, phase: TouchPhase) {
-        commandQueue.trySend(CommandRequest { it.touchEvent(x, y, phase) })
+        commandQueue.trySend(
+            CommandRequest(block = { it.touchEvent(x, y, phase) }),
+        )
     }
 
     suspend fun disconnect(force: Boolean = false) = sessionMutex.withLock {

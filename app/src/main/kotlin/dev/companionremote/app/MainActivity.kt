@@ -68,7 +68,7 @@ class MainActivity : ComponentActivity() {
     private fun handleIntent(intent: Intent?) {
         val token = intent?.getStringExtra(EXTRA_OPEN_LAST_REMOTE_TOKEN)
         if (RemoteSessionManager.get(this).consumeOpenFullRemoteToken(token)) {
-            intent.removeExtra(EXTRA_OPEN_LAST_REMOTE_TOKEN)
+            intent?.removeExtra(EXTRA_OPEN_LAST_REMOTE_TOKEN)
             viewModel.openLastRemote()
         }
     }
