@@ -9,6 +9,13 @@
         <item name="android:windowDisablePreview">true</item>
     </style>
 
+    <style name="Theme.CyberRemote.QuickDialog" parent="android:style/Theme.Material.Dialog.NoActionBar">
+        <item name="android:windowBackground">@android:color/transparent</item>
+        <item name="android:windowNoTitle">true</item>
+        <item name="android:backgroundDimEnabled">true</item>
+        <item name="android:windowCloseOnTouchOutside">true</item>
+    </style>
+
     <style name="NotificationRemoteRow">
         <item name="android:layout_width">match_parent</item>
         <item name="android:layout_height">40dp</item>
@@ -38,5 +45,41 @@
         <item name="android:background">@drawable/notification_remote_button_accent</item>
         <item name="android:textColor">@color/notification_remote_accent_text</item>
         <item name="android:textSize">12sp</item>
+    </style>
+
+    <style name="QuickDialogRemoteRow">
+        <item name="android:layout_width">match_parent</item>
+        <item name="android:layout_height">wrap_content</item>
+        <item name="android:minHeight">52dp</item>
+        <item name="android:gravity">center</item>
+        <item name="android:orientation">horizontal</item>
+    </style>
+
+    <style name="QuickDialogRemoteSpacer">
+        <item name="android:layout_width">0dp</item>
+        <item name="android:layout_height">1dp</item>
+        <item name="android:layout_weight">1</item>
+    </style>
+
+    <style name="QuickDialogRemoteButton">
+        <item name="android:layout_width">0dp</item>
+        <item name="android:layout_height">wrap_content</item>
+        <item name="android:minHeight">48dp</item>
+        <item name="android:layout_weight">1</item>
+        <item name="android:layout_margin">3dp</item>
+        <item name="android:background">@drawable/notification_remote_button</item>
+        <item name="android:foreground">?android:attr/selectableItemBackground</item>
+        <item name="android:gravity">center</item>
+        <item name="android:paddingTop">6dp</item>
+        <item name="android:paddingBottom">6dp</item>
+        <item name="android:textColor">@color/notification_remote_text</item>
+        <item name="android:textSize">20sp</item>
+        <item name="android:textStyle">bold</item>
+    </style>
+
+    <style name="QuickDialogRemoteButtonAccent" parent="QuickDialogRemoteButton">
+        <item name="android:background">@drawable/notification_remote_button_accent</item>
+        <item name="android:textColor">@color/notification_remote_accent_text</item>
+        <item name="android:textSize">14sp</item>
     </style>
 </resources>

@@ -20,7 +20,10 @@ enum class QuickRemoteAction(val wireValue: String) {
     Sleep("sleep"),
     ;
 
-    suspend fun execute(session: RemoteSessionManager): Boolean = session.execute { client ->
+    suspend fun execute(
+        session: RemoteSessionManager,
+        requireUnlocked: Boolean = false,
+    ): Boolean = session.execute(requireUnlocked = requireUnlocked) { client ->
         when (this) {
             Up -> client.pressButton(HidCommand.Up)
             Down -> client.pressButton(HidCommand.Down)

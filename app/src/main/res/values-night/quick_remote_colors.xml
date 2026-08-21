@@ -5,4 +5,5 @@
     <color name="notification_remote_button">#FF303844</color>
     <color name="notification_remote_button_accent">#FF9ECEFF</color>
     <color name="notification_remote_accent_text">#FF101418</color>
+    <color name="quick_remote_dialog_surface">#FF191E24</color>
 </resources>

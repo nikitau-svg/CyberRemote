@@ -382,7 +382,7 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
 
     /** Run a remote-control action, flipping to Disconnected on I/O errors. */
     fun withClient(block: suspend (dev.companionremote.protocol.client.CompanionClient) -> Unit) =
-        remoteSession.launchCommand(block)
+        remoteSession.launchCommand(block = block)
 
     fun pressButton(command: HidCommand) = withClient { it.pressButton(command) }
 

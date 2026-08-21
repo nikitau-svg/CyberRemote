@@ -12,8 +12,8 @@ android {
         applicationId = "dev.companionremote.nikita"
         minSdk = 26
         targetSdk = 35
-        versionCode = 4
-        versionName = "1.1.0-qs"
+        versionCode = 5
+        versionName = "1.1.1-qs"
     }
 
     buildTypes {

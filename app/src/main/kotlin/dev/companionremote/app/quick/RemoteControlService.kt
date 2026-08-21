@@ -44,7 +44,9 @@ class RemoteControlService : Service() {
         scope.launch {
             for (action in commandQueue) {
                 // Custom notification controls must never work from lockscreen.
-                if (!keyguard.isKeyguardLocked) action.execute(session)
+                if (!keyguard.isKeyguardLocked) {
+                    action.execute(session, requireUnlocked = true)
+                }
             }
         }
         scope.launch {
@@ -136,6 +138,9 @@ class RemoteControlService : Service() {
         fun stop(context: Context) {
             context.stopService(Intent(context, RemoteControlService::class.java))
         }
+
+        fun notificationsEnabled(context: Context): Boolean =
+            RemoteNotification.notificationsEnabled(context)
     }
 }
 
@@ -157,6 +162,13 @@ private object RemoteNotification {
                 lockscreenVisibility = Notification.VISIBILITY_SECRET
             },
         )
+    }
+
+    fun notificationsEnabled(context: Context): Boolean {
+        val manager = context.getSystemService(NotificationManager::class.java)
+        if (!manager.areNotificationsEnabled()) return false
+        val channel = manager.getNotificationChannel(CHANNEL_ID)
+        return channel == null || channel.importance != NotificationManager.IMPORTANCE_NONE
     }
 
     fun build(
@@ -233,7 +245,7 @@ private object RemoteNotification {
             context,
             requestCode,
             Intent(context, RemotePanelActivity::class.java)
-                .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TOP),
+                .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK),
             PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE,
         )
 }

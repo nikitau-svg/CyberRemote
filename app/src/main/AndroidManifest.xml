@@ -51,7 +51,9 @@
             android:theme="@style/Theme.CyberRemote.RemotePanel"
             android:exported="false"
             android:excludeFromRecents="true"
-            android:launchMode="singleTop"
+            android:autoRemoveFromRecents="true"
+            android:taskAffinity=""
+            android:launchMode="singleTask"
             android:finishOnTaskLaunch="true" />
 
         <service

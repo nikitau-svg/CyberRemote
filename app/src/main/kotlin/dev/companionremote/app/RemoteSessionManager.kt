@@ -1,5 +1,6 @@
 package dev.companionremote.app
 
+import android.app.KeyguardManager
 import android.content.Context
 import dev.companionremote.app.data.CredentialsRepository
 import dev.companionremote.app.data.SettingsRepository
@@ -45,6 +46,7 @@ class RemoteSessionManager private constructor(context: Context) {
     private val credentialsRepository = CredentialsRepository(appContext)
     private val settingsRepository = SettingsRepository(appContext)
     private val discovery = AtvDiscovery(appContext)
+    private val keyguard = appContext.getSystemService(KeyguardManager::class.java)
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
     private val sessionMutex = Mutex()
 
@@ -71,6 +73,7 @@ class RemoteSessionManager private constructor(context: Context) {
     private data class CommandRequest(
         val block: suspend (CompanionClient) -> Unit,
         val result: CompletableDeferred<Boolean>? = null,
+        val requireUnlocked: Boolean = false,
     )
 
     private val commandQueue = Channel<CommandRequest>(capacity = COMMAND_QUEUE_CAPACITY)
@@ -79,7 +82,7 @@ class RemoteSessionManager private constructor(context: Context) {
         scope.launch {
             for (request in commandQueue) {
                 try {
-                    val success = executeImmediate(request.block)
+                    val success = executeImmediate(request)
                     request.result?.complete(success)
                 } catch (e: CancellationException) {
                     request.result?.cancel(e)
@@ -136,25 +139,37 @@ class RemoteSessionManager private constructor(context: Context) {
         connectLocked(device, creds)
     }
 
-    fun launchCommand(block: suspend (CompanionClient) -> Unit) {
-        commandQueue.trySend(CommandRequest(block))
+    fun launchCommand(
+        requireUnlocked: Boolean = false,
+        block: suspend (CompanionClient) -> Unit,
+    ) {
+        commandQueue.trySend(CommandRequest(block, requireUnlocked = requireUnlocked))
     }
 
-    suspend fun execute(block: suspend (CompanionClient) -> Unit): Boolean {
+    suspend fun execute(
+        requireUnlocked: Boolean = false,
+        block: suspend (CompanionClient) -> Unit,
+    ): Boolean {
         val result = CompletableDeferred<Boolean>()
-        commandQueue.send(CommandRequest(block, result))
+        commandQueue.send(CommandRequest(block, result, requireUnlocked))
         return result.await()
     }
 
-    private suspend fun executeImmediate(block: suspend (CompanionClient) -> Unit): Boolean =
+    private suspend fun executeImmediate(request: CommandRequest): Boolean =
         sessionMutex.withLock {
             try {
                 // Discard stale queued input after every visible/foreground
                 // owner has gone away; it must not resurrect a hidden socket.
                 if (!hasOwner()) return@withLock false
+                if (request.requireUnlocked && keyguard.isKeyguardLocked) return@withLock false
                 if (client == null && !connectLastPairedLocked()) return@withLock false
                 val current = client ?: return@withLock false
-                withTimeout(COMMAND_TIMEOUT_MS) { block(current) }
+                // Connecting can take several seconds. Re-check immediately
+                // before the command so closed UI and queued shade input
+                // cannot cross a newly displayed lock screen.
+                if (!hasOwner()) return@withLock false
+                if (request.requireUnlocked && keyguard.isKeyguardLocked) return@withLock false
+                withTimeout(COMMAND_TIMEOUT_MS) { request.block(current) }
                 true
             } catch (e: TimeoutCancellationException) {
                 closeLocked()

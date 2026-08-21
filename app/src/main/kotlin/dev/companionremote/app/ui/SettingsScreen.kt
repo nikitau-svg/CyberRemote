@@ -240,7 +240,7 @@ fun SettingsScreen(viewModel: AppViewModel) {
                     Column(Modifier.padding(start = 16.dp).weight(1f)) {
                         Text("Add Apple TV tile", style = MaterialTheme.typography.bodyLarge, fontWeight = FontWeight.Medium)
                         Text(
-                            "Open the compact remote and persistent shade controls.",
+                            "Open a system mini remote and persistent shade controls.",
                             style = MaterialTheme.typography.bodySmall,
                             color = MaterialTheme.colorScheme.onSurfaceVariant,
                         )

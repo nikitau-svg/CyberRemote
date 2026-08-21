@@ -1,0 +1,98 @@
+<?xml version="1.0" encoding="utf-8"?>
+<LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    android:layout_width="match_parent"
+    android:layout_height="wrap_content"
+    android:background="@drawable/quick_remote_dialog_background"
+    android:elevation="12dp"
+    android:orientation="vertical"
+    android:paddingStart="16dp"
+    android:paddingTop="12dp"
+    android:paddingEnd="16dp"
+    android:paddingBottom="16dp">
+
+    <LinearLayout
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:minHeight="56dp"
+        android:gravity="center_vertical"
+        android:orientation="horizontal">
+
+        <LinearLayout
+            android:layout_width="0dp"
+            android:layout_height="wrap_content"
+            android:layout_weight="1"
+            android:orientation="vertical">
+
+            <TextView
+                android:id="@+id/dialog_remote_title"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:ellipsize="end"
+                android:maxLines="1"
+                android:text="Apple TV"
+                android:textColor="@color/notification_remote_text"
+                android:textSize="17sp"
+                android:textStyle="bold" />
+
+            <TextView
+                android:id="@+id/dialog_remote_status"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:ellipsize="end"
+                android:maxLines="1"
+                android:text="Connecting…"
+                android:textColor="@color/notification_remote_text_secondary"
+                android:textSize="12sp" />
+        </LinearLayout>
+
+        <TextView
+            android:id="@+id/dialog_open_full"
+            android:layout_width="48dp"
+            android:layout_height="48dp"
+            android:background="@drawable/notification_remote_button"
+            android:contentDescription="Open full remote"
+            android:foreground="?android:attr/selectableItemBackground"
+            android:gravity="center"
+            android:text="↗"
+            android:textColor="@color/notification_remote_text"
+            android:textSize="22sp"
+            android:textStyle="bold" />
+
+        <TextView
+            android:id="@+id/dialog_remote_close"
+            android:layout_width="48dp"
+            android:layout_height="48dp"
+            android:layout_marginStart="6dp"
+            android:background="@drawable/notification_remote_button"
+            android:contentDescription="Close remote"
+            android:foreground="?android:attr/selectableItemBackground"
+            android:gravity="center"
+            android:text="×"
+            android:textColor="@color/notification_remote_text"
+            android:textSize="24sp" />
+    </LinearLayout>
+
+    <LinearLayout style="@style/QuickDialogRemoteRow">
+        <TextView style="@style/QuickDialogRemoteSpacer" android:text="" />
+        <TextView android:id="@+id/dialog_remote_up" style="@style/QuickDialogRemoteButton" android:contentDescription="Up" android:text="↑" />
+        <TextView style="@style/QuickDialogRemoteSpacer" android:text="" />
+    </LinearLayout>
+
+    <LinearLayout style="@style/QuickDialogRemoteRow">
+        <TextView android:id="@+id/dialog_remote_left" style="@style/QuickDialogRemoteButton" android:contentDescription="Left" android:text="←" />
+        <TextView android:id="@+id/dialog_remote_ok" style="@style/QuickDialogRemoteButtonAccent" android:contentDescription="OK" android:text="OK" />
+        <TextView android:id="@+id/dialog_remote_right" style="@style/QuickDialogRemoteButton" android:contentDescription="Right" android:text="→" />
+    </LinearLayout>
+
+    <LinearLayout style="@style/QuickDialogRemoteRow">
+        <TextView android:id="@+id/dialog_remote_back" style="@style/QuickDialogRemoteButton" android:contentDescription="Back" android:text="↩" />
+        <TextView android:id="@+id/dialog_remote_down" style="@style/QuickDialogRemoteButton" android:contentDescription="Down" android:text="↓" />
+        <TextView android:id="@+id/dialog_remote_play" style="@style/QuickDialogRemoteButton" android:contentDescription="Play or pause" android:text="▶Ⅱ" />
+    </LinearLayout>
+
+    <LinearLayout style="@style/QuickDialogRemoteRow">
+        <TextView android:id="@+id/dialog_remote_volume_down" style="@style/QuickDialogRemoteButton" android:contentDescription="Volume down" android:text="−" />
+        <TextView android:id="@+id/dialog_remote_home" style="@style/QuickDialogRemoteButton" android:contentDescription="Home" android:text="⌂" />
+        <TextView android:id="@+id/dialog_remote_volume_up" style="@style/QuickDialogRemoteButton" android:contentDescription="Volume up" android:text="+" />
+    </LinearLayout>
+</LinearLayout>

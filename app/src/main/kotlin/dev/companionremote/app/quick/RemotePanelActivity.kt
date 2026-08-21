@@ -65,7 +65,7 @@ import dev.companionremote.app.data.AppSkin
 import dev.companionremote.app.theme.skinColorScheme
 import kotlinx.coroutines.launch
 
-/** Bottom dialog launched by the Quick Settings tile. No overlay permission. */
+/** Activity fallback used by notification taps and OEMs that reject the QS dialog. */
 class RemotePanelActivity : ComponentActivity() {
 
     private lateinit var session: RemoteSessionManager
@@ -74,8 +74,8 @@ class RemotePanelActivity : ComponentActivity() {
     private val notificationPermission = registerForActivityResult(
         ActivityResultContracts.RequestPermission(),
     ) { granted ->
-        persistentControlsEnabled = granted
-        if (granted) {
+        persistentControlsEnabled = granted && RemoteControlService.notificationsEnabled(this)
+        if (persistentControlsEnabled) {
             RemoteControlService.start(this)
         } else {
             RemoteControlService.stop(this)
@@ -123,8 +123,12 @@ class RemotePanelActivity : ComponentActivity() {
         ) {
             notificationPermission.launch(Manifest.permission.POST_NOTIFICATIONS)
         } else {
-            persistentControlsEnabled = true
-            RemoteControlService.start(this)
+            persistentControlsEnabled = RemoteControlService.notificationsEnabled(this)
+            if (persistentControlsEnabled) {
+                RemoteControlService.start(this)
+            } else {
+                RemoteControlService.stop(this)
+            }
         }
     }
 
@@ -146,7 +150,7 @@ class RemotePanelActivity : ComponentActivity() {
         if (persistentControlsEnabled) {
             RemoteControlService.send(this, action)
         } else {
-            lifecycleScope.launch { action.execute(session) }
+            lifecycleScope.launch { action.execute(session, requireUnlocked = true) }
         }
     }
 }
