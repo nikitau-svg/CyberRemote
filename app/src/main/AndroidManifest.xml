@@ -56,6 +56,16 @@
             android:launchMode="singleTask"
             android:finishOnTaskLaunch="true" />
 
+        <activity
+            android:name=".quick.FullRemoteActivity"
+            android:theme="@style/Theme.CyberRemote.FullRemote"
+            android:exported="false"
+            android:excludeFromRecents="true"
+            android:autoRemoveFromRecents="true"
+            android:taskAffinity=""
+            android:launchMode="singleTop"
+            android:finishOnTaskLaunch="true" />
+
         <service
             android:name=".quick.RemoteControlService"
             android:exported="false"

@@ -30,7 +30,7 @@ jobs:
           java-version: "17"
       - uses: gradle/actions/setup-gradle@v4
       - name: Build unsigned release APK
-        run: ./gradlew :app:assembleRelease --no-daemon
+        run: ./gradlew :app:testDebugUnitTest :app:assembleRelease --no-daemon
       - name: Record APK checksum
         working-directory: app/build/outputs/apk/release
         run: sha256sum *.apk | tee SHA256SUMS.txt

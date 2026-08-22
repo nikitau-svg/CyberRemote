@@ -1,6 +1,8 @@
 package dev.companionremote.app
 
 import android.app.Application
+import android.content.ComponentName
+import android.service.quicksettings.TileService
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import dev.companionremote.app.data.AppSkin
@@ -15,6 +17,7 @@ import dev.companionremote.app.i18n.AppStrings
 import dev.companionremote.app.i18n.EnglishStrings
 import dev.companionremote.app.i18n.currentSystemLanguage
 import dev.companionremote.app.i18n.resolveStrings
+import dev.companionremote.app.quick.RemoteTileService
 import dev.companionremote.protocol.client.HidCommand
 import dev.companionremote.protocol.client.KeyboardFocusState
 import dev.companionremote.protocol.client.TouchPhase
@@ -82,6 +85,9 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
     /** Whether the first-run remote tutorial has already been shown. */
     val introSeen = MutableStateFlow(false)
 
+    /** Safe lock-screen controls are disabled until the user explicitly opts in. */
+    val lockScreenControls = MutableStateFlow(false)
+
     // Where to return when leaving Settings (device list or the remote).
     private var settingsReturnTo: Screen = Screen.DeviceList
 
@@ -140,6 +146,9 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
             settingsRepository.introSeen.collect { introSeen.value = it }
         }
         viewModelScope.launch {
+            settingsRepository.lockScreenControls.collect { lockScreenControls.value = it }
+        }
+        viewModelScope.launch {
             remoteSession.keyboardFocus.collect { state ->
                 if (state == KeyboardFocusState.Focused) {
                     remoteSession.execute { client ->
@@ -179,6 +188,10 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
 
     fun markIntroSeen() {
         viewModelScope.launch { settingsRepository.setIntroSeen(true) }
+    }
+
+    fun setLockScreenControls(enabled: Boolean) {
+        viewModelScope.launch { settingsRepository.setLockScreenControls(enabled) }
     }
 
     fun openSettings() {
@@ -242,6 +255,7 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
             settingsRepository.clearLastDeviceIf(name)
             pairedDevices.value = credentialsRepository.pairedDeviceNames().sorted()
             deviceList.value = deviceList.value.copy(pairedNames = deviceList.value.pairedNames - name)
+            requestRemoteTileRefresh()
         }
     }
 
@@ -250,6 +264,7 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
         viewModelScope.launch {
             val pairedNames = credentialsRepository.pairedDeviceNames().toSet()
             deviceList.value = deviceList.value.copy(scanning = true, pairedNames = pairedNames)
+            requestRemoteTileRefresh()
             runCatching {
                 discovery.scan(durationMs = 6_000) { device ->
                     val current = deviceList.value
@@ -294,6 +309,7 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
             deviceList.value = deviceList.value.copy(
                 pairedNames = deviceList.value.pairedNames - device.name,
             )
+            requestRemoteTileRefresh()
         }
     }
 
@@ -324,6 +340,7 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
             try {
                 val credentials = setup.finishPairing(pin)
                 credentialsRepository.save(device.name, credentials.toString())
+                requestRemoteTileRefresh()
                 pairingConnection?.close()
                 pairingConnection = null
                 pairSetup = null
@@ -378,6 +395,14 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
         activeDeviceName.value = null
         remoteSession.setUiOwner(false)
         screen.value = Screen.DeviceList
+    }
+
+    private fun requestRemoteTileRefresh() {
+        val app = getApplication<Application>()
+        TileService.requestListeningState(
+            app,
+            ComponentName(app, RemoteTileService::class.java),
+        )
     }
 
     /** Run a remote-control action, flipping to Disconnected on I/O errors. */

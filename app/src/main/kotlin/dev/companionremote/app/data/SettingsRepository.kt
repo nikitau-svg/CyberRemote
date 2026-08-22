@@ -34,6 +34,7 @@ class SettingsRepository(context: Context) {
     private val hapticEnabledKey = booleanPreferencesKey("haptic_enabled")
     private val hapticStrengthKey = stringPreferencesKey("haptic_strength")
     private val introSeenKey = booleanPreferencesKey("intro_seen")
+    private val lockScreenControlsKey = booleanPreferencesKey("lock_screen_controls")
     private val lastDeviceNameKey = stringPreferencesKey("last_device_name")
     private val lastDeviceHostKey = stringPreferencesKey("last_device_host")
     private val lastDevicePortKey = intPreferencesKey("last_device_port")
@@ -84,6 +85,11 @@ class SettingsRepository(context: Context) {
     /** Whether the first-run remote tutorial has been shown. */
     val introSeen: Flow<Boolean> = appContext.settingsDataStore.data.map { prefs ->
         prefs[introSeenKey] ?: false
+    }
+
+    /** Explicit opt-in for a small, non-destructive command set on keyguard. */
+    val lockScreenControls: Flow<Boolean> = appContext.settingsDataStore.data.map { prefs ->
+        prefs[lockScreenControlsKey] ?: false
     }
 
     suspend fun setLanguage(language: AppLanguage) {
@@ -137,6 +143,10 @@ class SettingsRepository(context: Context) {
 
     suspend fun setIntroSeen(seen: Boolean) {
         appContext.settingsDataStore.edit { prefs -> prefs[introSeenKey] = seen }
+    }
+
+    suspend fun setLockScreenControls(enabled: Boolean) {
+        appContext.settingsDataStore.edit { prefs -> prefs[lockScreenControlsKey] = enabled }
     }
 
     /** Last successfully connected device, including its cached Companion port. */

@@ -147,11 +147,7 @@ class RemotePanelActivity : ComponentActivity() {
     }
 
     private fun sendAction(action: QuickRemoteAction) {
-        if (persistentControlsEnabled) {
-            RemoteControlService.send(this, action)
-        } else {
-            lifecycleScope.launch { action.execute(session, requireUnlocked = true) }
-        }
+        lifecycleScope.launch { action.execute(session, requireUnlocked = true) }
     }
 }
 

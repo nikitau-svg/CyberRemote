@@ -28,6 +28,7 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.rounded.ContentCopy
 import androidx.compose.material.icons.rounded.DeleteOutline
+import androidx.compose.material.icons.rounded.Lock
 import androidx.compose.material.icons.rounded.MailOutline
 import androidx.compose.material.icons.rounded.Refresh
 import androidx.compose.material.icons.rounded.Tv
@@ -83,6 +84,7 @@ fun SettingsScreen(viewModel: AppViewModel) {
     val fetchIcons by viewModel.fetchAppIcons.collectAsState()
     val hapticEnabled by viewModel.hapticEnabled.collectAsState()
     val hapticStrength by viewModel.hapticStrength.collectAsState()
+    val lockScreenControls by viewModel.lockScreenControls.collectAsState()
     val paired by viewModel.pairedDevices.collectAsState()
     val activeDevice by viewModel.activeDeviceName.collectAsState()
     val deviceVerify by viewModel.deviceVerify.collectAsState()
@@ -240,11 +242,42 @@ fun SettingsScreen(viewModel: AppViewModel) {
                     Column(Modifier.padding(start = 16.dp).weight(1f)) {
                         Text("Add Apple TV tile", style = MaterialTheme.typography.bodyLarge, fontWeight = FontWeight.Medium)
                         Text(
-                            "Open a system mini remote and persistent shade controls.",
+                            "Open the Apple-style remote and native media controls.",
                             style = MaterialTheme.typography.bodySmall,
                             color = MaterialTheme.colorScheme.onSurfaceVariant,
                         )
                     }
+                }
+                Row(
+                    Modifier.fillMaxWidth().padding(16.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    Box(
+                        Modifier.size(40.dp).background(MaterialTheme.colorScheme.secondaryContainer, CircleShape),
+                        contentAlignment = Alignment.Center,
+                    ) {
+                        Icon(
+                            Icons.Rounded.Lock,
+                            contentDescription = null,
+                            tint = MaterialTheme.colorScheme.onSecondaryContainer,
+                        )
+                    }
+                    Column(Modifier.padding(start = 16.dp, end = 12.dp).weight(1f)) {
+                        Text(
+                            "Controls on lock screen",
+                            style = MaterialTheme.typography.bodyLarge,
+                            fontWeight = FontWeight.Medium,
+                        )
+                        Text(
+                            "Allows navigation, Play/Pause and volume. Back, OK, Home and power still require unlock.",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        )
+                    }
+                    Switch(
+                        checked = lockScreenControls,
+                        onCheckedChange = viewModel::setLockScreenControls,
+                    )
                 }
             }
 

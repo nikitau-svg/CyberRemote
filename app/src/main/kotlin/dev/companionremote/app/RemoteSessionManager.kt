@@ -1,11 +1,18 @@
 package dev.companionremote.app
 
 import android.app.KeyguardManager
+import android.content.ComponentName
 import android.content.Context
+import android.os.SystemClock
+import android.service.quicksettings.TileService
 import dev.companionremote.app.data.CredentialsRepository
 import dev.companionremote.app.data.SettingsRepository
 import dev.companionremote.app.discovery.AtvDiscovery
 import dev.companionremote.app.discovery.DiscoveredAtv
+import dev.companionremote.app.quick.LockScreenRemotePolicy
+import dev.companionremote.app.quick.LockedRemoteRateLimiter
+import dev.companionremote.app.quick.QuickRemoteAction
+import dev.companionremote.app.quick.RemoteTileService
 import dev.companionremote.protocol.client.CompanionClient
 import dev.companionremote.protocol.client.KeyboardFocusState
 import dev.companionremote.protocol.client.TouchPhase
@@ -23,7 +30,9 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.TimeoutCancellationException
+import kotlinx.coroutines.async
 import kotlinx.coroutines.channels.Channel
+import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
@@ -49,6 +58,7 @@ class RemoteSessionManager private constructor(context: Context) {
     private val keyguard = appContext.getSystemService(KeyguardManager::class.java)
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
     private val sessionMutex = Mutex()
+    private val lockedRateLimiter = LockedRemoteRateLimiter { SystemClock.elapsedRealtime() }
 
     private var client: CompanionClient? = null
     private var credentials: HapCredentials? = null
@@ -56,7 +66,9 @@ class RemoteSessionManager private constructor(context: Context) {
     private var uiOwner = false
     private var panelOwner = false
     private var quickRemoteOwner = false
+    private var lockScreenRemoteOwner = false
     private var openFullRemoteToken: String? = null
+    @Volatile private var lockScreenControlsEnabled = false
 
     private val _connectionState = MutableStateFlow(ConnectionState.Disconnected)
     val connectionState: StateFlow<ConnectionState> = _connectionState
@@ -73,7 +85,11 @@ class RemoteSessionManager private constructor(context: Context) {
     private data class CommandRequest(
         val block: suspend (CompanionClient) -> Unit,
         val result: CompletableDeferred<Boolean>? = null,
-        val requireUnlocked: Boolean = false,
+        val requireUnlocked: Boolean = true,
+        val allowReconnect: Boolean = true,
+        val expiresAtElapsedMs: Long = Long.MAX_VALUE,
+        val lockScreenAction: QuickRemoteAction? = null,
+        val authorizationStillValid: (() -> Boolean)? = null,
     )
 
     private val commandQueue = Channel<CommandRequest>(capacity = COMMAND_QUEUE_CAPACITY)
@@ -94,6 +110,17 @@ class RemoteSessionManager private constructor(context: Context) {
                 }
             }
         }
+        scope.launch {
+            settingsRepository.lockScreenControls.collect { lockScreenControlsEnabled = it }
+        }
+        scope.launch {
+            connectionState.collect {
+                TileService.requestListeningState(
+                    appContext,
+                    ComponentName(appContext, RemoteTileService::class.java),
+                )
+            }
+        }
     }
 
     fun setUiOwner(active: Boolean) {
@@ -111,6 +138,11 @@ class RemoteSessionManager private constructor(context: Context) {
         if (!active) scope.launch { disconnectIfUnused() }
     }
 
+    fun setLockScreenRemoteOwner(active: Boolean) {
+        synchronized(this) { lockScreenRemoteOwner = active }
+        if (!active) scope.launch { disconnectIfUnused() }
+    }
+
     /** One-use capability for the non-exported panel to steer MainActivity. */
     fun issueOpenFullRemoteToken(): String = synchronized(this) {
         UUID.randomUUID().toString().also { openFullRemoteToken = it }
@@ -123,35 +155,91 @@ class RemoteSessionManager private constructor(context: Context) {
     }
 
     suspend fun connect(device: DiscoveredAtv, credentials: HapCredentials): Boolean =
-        sessionMutex.withLock { connectLocked(device, credentials) }
+        sessionMutex.withLock {
+            connectLocked(device, credentials) { !keyguard.isKeyguardLocked }
+        }
 
-    suspend fun connectLastPaired(): Boolean = sessionMutex.withLock {
+    suspend fun connectLastPaired(
+        requireUnlocked: Boolean = true,
+        authorizationStillValid: () -> Boolean = { true },
+    ): Boolean = sessionMutex.withLock {
+        if (!authorizationStillValid()) return@withLock false
+        if (requireUnlocked && keyguard.isKeyguardLocked) return@withLock false
         if (client != null && _connectionState.value == ConnectionState.Connected) return@withLock true
-        connectLastPairedLocked()
+        val connected = connectLastPairedLocked {
+            authorizationStillValid() && (!requireUnlocked || !keyguard.isKeyguardLocked)
+        }
+        if (!authorizationStillValid() || (requireUnlocked && keyguard.isKeyguardLocked)) {
+            closeLocked()
+            false
+        } else {
+            connected
+        }
     }
 
     suspend fun reconnect(): Boolean = sessionMutex.withLock {
+        if (keyguard.isKeyguardLocked) return@withLock false
         val device = _activeDevice.value ?: settingsRepository.lastDevice()
-            ?: return@withLock connectLastPairedLocked()
+        if (device == null) {
+            val connected = connectLastPairedLocked { !keyguard.isKeyguardLocked }
+            if (keyguard.isKeyguardLocked) {
+                closeLocked()
+                return@withLock false
+            }
+            return@withLock connected
+        }
         val creds = credentials ?: credentialsRepository.load(device.name)?.let { stored ->
             runCatching { HapCredentials.parse(stored) }.getOrNull()
         } ?: return@withLock failLocked("Pairing credentials are invalid")
-        connectLocked(device, creds)
+        val connected = connectLocked(device, creds) { !keyguard.isKeyguardLocked }
+        if (keyguard.isKeyguardLocked) {
+            closeLocked()
+            false
+        } else {
+            connected
+        }
     }
 
     fun launchCommand(
-        requireUnlocked: Boolean = false,
+        requireUnlocked: Boolean = true,
+        allowReconnect: Boolean = true,
+        maxAgeMs: Long? = null,
+        lockScreenAction: QuickRemoteAction? = null,
+        authorizationStillValid: (() -> Boolean)? = null,
         block: suspend (CompanionClient) -> Unit,
     ) {
-        commandQueue.trySend(CommandRequest(block, requireUnlocked = requireUnlocked))
+        commandQueue.trySend(
+            CommandRequest(
+                block = block,
+                requireUnlocked = requireUnlocked,
+                allowReconnect = allowReconnect,
+                expiresAtElapsedMs = expiryFor(maxAgeMs),
+                lockScreenAction = lockScreenAction,
+                authorizationStillValid = authorizationStillValid,
+            ),
+        )
     }
 
     suspend fun execute(
-        requireUnlocked: Boolean = false,
+        requireUnlocked: Boolean = true,
+        allowReconnect: Boolean = true,
+        maxAgeMs: Long? = null,
+        lockScreenAction: QuickRemoteAction? = null,
+        authorizationStillValid: (() -> Boolean)? = null,
         block: suspend (CompanionClient) -> Unit,
     ): Boolean {
         val result = CompletableDeferred<Boolean>()
-        commandQueue.send(CommandRequest(block, result, requireUnlocked))
+        commandQueue.send(
+            CommandRequest(
+                block = block,
+                result = result,
+                requireUnlocked = requireUnlocked,
+                allowReconnect = allowReconnect,
+                expiresAtElapsedMs = expiryFor(maxAgeMs),
+                lockScreenAction = lockScreenAction,
+                authorizationStillValid = authorizationStillValid,
+            ),
+        )
         return result.await()
     }
 
@@ -161,14 +249,27 @@ class RemoteSessionManager private constructor(context: Context) {
                 // Discard stale queued input after every visible/foreground
                 // owner has gone away; it must not resurrect a hidden socket.
                 if (!hasOwner()) return@withLock false
-                if (request.requireUnlocked && keyguard.isKeyguardLocked) return@withLock false
-                if (client == null && !connectLastPairedLocked()) return@withLock false
+                if (request.authorizationStillValid?.invoke() == false) return@withLock false
+                if (request.isExpired()) return@withLock false
+                if (!isCommandAllowed(request, consumeLockedRate = false)) return@withLock false
+                if (client == null && !request.allowReconnect) return@withLock false
+                if (
+                    client == null &&
+                    !connectLastPairedLocked { request.isStillAuthorizedForConnection() }
+                ) {
+                    return@withLock false
+                }
                 val current = client ?: return@withLock false
                 // Connecting can take several seconds. Re-check immediately
                 // before the command so closed UI and queued shade input
                 // cannot cross a newly displayed lock screen.
                 if (!hasOwner()) return@withLock false
-                if (request.requireUnlocked && keyguard.isKeyguardLocked) return@withLock false
+                if (request.authorizationStillValid?.invoke() == false) return@withLock false
+                if (request.isExpired()) return@withLock false
+                if (!isCommandAllowed(request, consumeLockedRate = true)) {
+                    if (request.requireUnlocked && keyguard.isKeyguardLocked) closeLocked()
+                    return@withLock false
+                }
                 withTimeout(COMMAND_TIMEOUT_MS) { request.block(current) }
                 true
             } catch (e: TimeoutCancellationException) {
@@ -186,9 +287,42 @@ class RemoteSessionManager private constructor(context: Context) {
 
     fun queueTouch(x: Long, y: Long, phase: TouchPhase) {
         commandQueue.trySend(
-            CommandRequest(block = { it.touchEvent(x, y, phase) }),
+            CommandRequest(
+                block = { it.touchEvent(x, y, phase) },
+                requireUnlocked = true,
+            ),
         )
     }
+
+    private fun isCommandAllowed(
+        request: CommandRequest,
+        consumeLockedRate: Boolean,
+    ): Boolean {
+        val lockScreenAction = request.lockScreenAction
+        if (lockScreenAction != null) {
+            if (!LockScreenRemotePolicy.canExecute(lockScreenAction, true, lockScreenControlsEnabled)) {
+                return false
+            }
+            if (consumeLockedRate && !lockedRateLimiter.tryAcquire(lockScreenAction)) return false
+        }
+        if (!keyguard.isKeyguardLocked) return true
+        if (request.requireUnlocked) return false
+        return lockScreenAction != null
+    }
+
+    private fun expiryFor(maxAgeMs: Long?): Long = maxAgeMs
+        ?.coerceAtLeast(0L)
+        ?.let { SystemClock.elapsedRealtime() + it }
+        ?: Long.MAX_VALUE
+
+    private fun CommandRequest.isExpired(): Boolean =
+        expiresAtElapsedMs != Long.MAX_VALUE && SystemClock.elapsedRealtime() > expiresAtElapsedMs
+
+    private fun CommandRequest.isStillAuthorizedForConnection(): Boolean =
+        hasOwner() &&
+            authorizationStillValid?.invoke() != false &&
+            !isExpired() &&
+            isCommandAllowed(this, consumeLockedRate = false)
 
     suspend fun disconnect(force: Boolean = false) = sessionMutex.withLock {
         if (!force && hasOwner()) return@withLock
@@ -199,19 +333,29 @@ class RemoteSessionManager private constructor(context: Context) {
         disconnect(force = false)
     }
 
-    private fun hasOwner(): Boolean = synchronized(this) { uiOwner || panelOwner || quickRemoteOwner }
+    private fun hasOwner(): Boolean = synchronized(this) {
+        uiOwner || panelOwner || quickRemoteOwner || lockScreenRemoteOwner
+    }
 
-    private suspend fun connectLastPairedLocked(): Boolean {
+    private suspend fun connectLastPairedLocked(
+        stillAllowed: () -> Boolean = { true },
+    ): Boolean {
+        if (!stillAllowed()) return false
         var device = settingsRepository.lastDevice()
+        if (!stillAllowed()) return false
         var stored = device?.let { credentialsRepository.load(it.name) }
+        if (!stillAllowed()) return false
 
         if (device == null || stored == null) {
             val name = credentialsRepository.pairedDeviceNames().sorted().firstOrNull()
                 ?: return failLocked("Pair an Apple TV in the app first")
+            if (!stillAllowed()) return false
             stored = credentialsRepository.load(name)
                 ?: return failLocked("Pairing credentials are unavailable")
+            if (!stillAllowed()) return false
             device = discovery.resolveByName(name)
                 ?: return failLocked("Apple TV is not reachable on this Wi-Fi network")
+            if (!stillAllowed()) return false
         }
 
         val selectedDevice = device ?: return failLocked("No paired Apple TV is available")
@@ -219,13 +363,15 @@ class RemoteSessionManager private constructor(context: Context) {
         val parsed = runCatching { HapCredentials.parse(storedCredentials) }.getOrElse {
             return failLocked("Pairing credentials are invalid")
         }
-        return connectLocked(selectedDevice, parsed)
+        return connectLocked(selectedDevice, parsed, stillAllowed)
     }
 
     private suspend fun connectLocked(
         initialDevice: DiscoveredAtv,
         newCredentials: HapCredentials,
+        stillAllowed: () -> Boolean = { true },
     ): Boolean {
+        if (!stillAllowed()) return false
         if (
             client != null &&
             _connectionState.value == ConnectionState.Connected &&
@@ -241,9 +387,21 @@ class RemoteSessionManager private constructor(context: Context) {
         var target = initialDevice
         var lastError: Exception = IOException("Connection failed")
         repeat(RECONNECT_ATTEMPTS) { attempt ->
+            if (!stillAllowed()) {
+                closeLocked()
+                return false
+            }
             if (attempt > 0) {
                 delay(RECONNECT_DELAY_MS)
+                if (!stillAllowed()) {
+                    closeLocked()
+                    return false
+                }
                 target = discovery.resolveByName(initialDevice.name) ?: initialDevice
+                if (!stillAllowed()) {
+                    closeLocked()
+                    return false
+                }
             }
 
             var candidate: CompanionClient? = null
@@ -251,15 +409,36 @@ class RemoteSessionManager private constructor(context: Context) {
                 val transport = SocketTransport.connect(target.host, target.port, CONNECT_TIMEOUT_MS)
                 val newClient = CompanionClient(CompanionConnection(transport), newCredentials)
                 candidate = newClient
-                withTimeout(SESSION_TIMEOUT_MS) { newClient.connect() }
+                if (!stillAllowed()) {
+                    runCatching { newClient.close() }
+                    closeLocked()
+                    return false
+                }
+                withTimeout(SESSION_TIMEOUT_MS) {
+                    connectWhileAuthorized(newClient, stillAllowed)
+                }
+                if (!stillAllowed()) {
+                    runCatching { newClient.close() }
+                    closeLocked()
+                    return false
+                }
+                settingsRepository.setLastDevice(target)
+                if (!stillAllowed()) {
+                    runCatching { newClient.close() }
+                    closeLocked()
+                    return false
+                }
                 client = newClient
                 credentials = newCredentials
                 _activeDevice.value = target
                 _connectionState.value = ConnectionState.Connected
                 _connectionError.value = null
-                settingsRepository.setLastDevice(target)
                 observeKeyboard(newClient)
                 return true
+            } catch (_: ConnectionAuthorizationRevoked) {
+                runCatching { candidate?.close() }
+                closeLocked()
+                return false
             } catch (e: TimeoutCancellationException) {
                 runCatching { candidate?.close() }
                 lastError = e
@@ -274,6 +453,21 @@ class RemoteSessionManager private constructor(context: Context) {
         }
 
         return failLocked(friendlyError(lastError))
+    }
+
+    private suspend fun connectWhileAuthorized(
+        newClient: CompanionClient,
+        stillAllowed: () -> Boolean,
+    ) = coroutineScope {
+        val connection = async { newClient.connect() }
+        while (!connection.isCompleted) {
+            if (!stillAllowed()) {
+                connection.cancel()
+                throw ConnectionAuthorizationRevoked()
+            }
+            delay(CONNECTION_AUTH_POLL_MS)
+        }
+        connection.await()
     }
 
     private fun observeKeyboard(newClient: CompanionClient) {
@@ -329,6 +523,7 @@ class RemoteSessionManager private constructor(context: Context) {
         private const val COMMAND_TIMEOUT_MS = 10_000L
         private const val DISCONNECT_TIMEOUT_MS = 2_000L
         private const val COMMAND_QUEUE_CAPACITY = 256
+        private const val CONNECTION_AUTH_POLL_MS = 50L
 
         @Volatile
         private var instance: RemoteSessionManager? = null
@@ -339,3 +534,5 @@ class RemoteSessionManager private constructor(context: Context) {
             }
     }
 }
+
+private class ConnectionAuthorizationRevoked : Exception()

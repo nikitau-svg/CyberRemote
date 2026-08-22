@@ -22,8 +22,17 @@ enum class QuickRemoteAction(val wireValue: String) {
 
     suspend fun execute(
         session: RemoteSessionManager,
-        requireUnlocked: Boolean = false,
-    ): Boolean = session.execute(requireUnlocked = requireUnlocked) { client ->
+        requireUnlocked: Boolean = true,
+        allowReconnect: Boolean = true,
+        maxAgeMs: Long? = null,
+        authorizationStillValid: (() -> Boolean)? = null,
+    ): Boolean = session.execute(
+        requireUnlocked = requireUnlocked,
+        allowReconnect = allowReconnect,
+        maxAgeMs = maxAgeMs,
+        lockScreenAction = if (requireUnlocked) null else this,
+        authorizationStillValid = authorizationStillValid,
+    ) { client ->
         when (this) {
             Up -> client.pressButton(HidCommand.Up)
             Down -> client.pressButton(HidCommand.Down)
