@@ -1,6 +1,7 @@
 package dev.companionremote.app
 
 import android.os.Bundle
+import android.content.Intent
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.viewModels
@@ -18,6 +19,7 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
 import dev.companionremote.app.data.AppSkin
 import dev.companionremote.app.data.ThemeMode
+import dev.companionremote.app.diagnostics.Diagnostics
 import dev.companionremote.app.i18n.LocalAppStrings
 import dev.companionremote.app.i18n.currentSystemLanguage
 import dev.companionremote.app.i18n.resolveStrings
@@ -29,7 +31,6 @@ import dev.companionremote.app.ui.DeviceListScreen
 import dev.companionremote.app.ui.PairingScreen
 import dev.companionremote.app.ui.RemoteScreen
 import dev.companionremote.app.ui.SettingsScreen
-import dev.companionremote.app.ui.UpdateDialog
 
 class MainActivity : ComponentActivity() {
 
@@ -37,6 +38,7 @@ class MainActivity : ComponentActivity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        Diagnostics.record(this, "main_activity", "created")
         setContent {
             val themeMode by viewModel.themeMode.collectAsState()
             val skin by viewModel.skin.collectAsState()
@@ -53,21 +55,40 @@ class MainActivity : ComponentActivity() {
                             is Screen.Remote -> RemoteScreen(viewModel, current.device)
                         }
                     }
-                    val updateState by viewModel.updateState.collectAsState()
-                    UpdateDialog(
-                        state = updateState,
-                        onDownload = viewModel::downloadUpdate,
-                        onInstall = viewModel::installUpdate,
-                        onDismiss = viewModel::dismissUpdate,
-                    )
                 }
             }
+        }
+        handleIntent(intent)
+    }
+
+    override fun onNewIntent(intent: Intent) {
+        super.onNewIntent(intent)
+        setIntent(intent)
+        handleIntent(intent)
+    }
+
+    private fun handleIntent(intent: Intent?) {
+        val token = intent?.getStringExtra(EXTRA_OPEN_LAST_REMOTE_TOKEN)
+        if (RemoteSessionManager.get(this).consumeOpenFullRemoteToken(token)) {
+            intent?.removeExtra(EXTRA_OPEN_LAST_REMOTE_TOKEN)
+            viewModel.openLastRemote()
         }
     }
 
     override fun onStart() {
         super.onStart()
+        Diagnostics.record(this, "main_activity", "started")
         viewModel.onForeground()
+    }
+
+    override fun onStop() {
+        Diagnostics.record(this, "main_activity", "stopped")
+        viewModel.onBackground()
+        super.onStop()
+    }
+
+    companion object {
+        const val EXTRA_OPEN_LAST_REMOTE_TOKEN = "open_last_remote_token"
     }
 }
 

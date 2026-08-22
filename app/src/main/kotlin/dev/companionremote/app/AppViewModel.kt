@@ -1,6 +1,8 @@
 package dev.companionremote.app
 
 import android.app.Application
+import android.content.ComponentName
+import android.service.quicksettings.TileService
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import dev.companionremote.app.data.AppSkin
@@ -10,30 +12,26 @@ import dev.companionremote.app.data.SettingsRepository
 import dev.companionremote.app.data.ThemeMode
 import dev.companionremote.app.discovery.AtvDiscovery
 import dev.companionremote.app.discovery.DiscoveredAtv
+import dev.companionremote.app.diagnostics.Diagnostics
 import dev.companionremote.app.i18n.AppLanguage
 import dev.companionremote.app.i18n.AppStrings
 import dev.companionremote.app.i18n.EnglishStrings
 import dev.companionremote.app.i18n.currentSystemLanguage
 import dev.companionremote.app.i18n.resolveStrings
-import dev.companionremote.protocol.client.CompanionClient
+import dev.companionremote.app.quick.RemoteTileService
 import dev.companionremote.protocol.client.HidCommand
 import dev.companionremote.protocol.client.KeyboardFocusState
 import dev.companionremote.protocol.client.TouchPhase
-import kotlinx.coroutines.channels.Channel
 import dev.companionremote.protocol.companion.CompanionConnection
 import dev.companionremote.protocol.hap.HapCredentials
 import dev.companionremote.protocol.hap.PairSetup
 import dev.companionremote.protocol.hap.PairVerify
-import dev.companionremote.app.update.AppUpdater
-import dev.companionremote.app.update.UpdateInfo
 import dev.companionremote.protocol.transport.SocketTransport
-import java.io.File
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
-import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
-import kotlinx.coroutines.flow.StateFlow
-import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 
 /** Which screen is showing. */
 sealed interface Screen {
@@ -43,21 +41,8 @@ sealed interface Screen {
     data class Remote(val device: DiscoveredAtv) : Screen
 }
 
-enum class ConnectionState { Connecting, Connected, Disconnected }
-
 /** Per-device pairing check triggered by the refresh button in Settings. */
 enum class DeviceVerify { Idle, Checking, Ok, Failed }
-
-/** In-app update lifecycle (GitHub Releases). */
-sealed interface UpdateState {
-    data object Idle : UpdateState
-    data class Checking(val manual: Boolean) : UpdateState
-    data object UpToDate : UpdateState
-    data class Available(val info: UpdateInfo) : UpdateState
-    data class Downloading(val info: UpdateInfo, val progress: Float) : UpdateState
-    data class Ready(val info: UpdateInfo, val file: File) : UpdateState
-    data class Failed(val message: String?) : UpdateState
-}
 
 data class PairingUi(
     val awaitingPin: Boolean = false,
@@ -76,12 +61,13 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
     private val discovery = AtvDiscovery(application)
     private val credentialsRepository = CredentialsRepository(application)
     private val settingsRepository = SettingsRepository(application)
+    private val remoteSession = RemoteSessionManager.get(application)
 
     val screen = MutableStateFlow<Screen>(Screen.DeviceList)
     val deviceList = MutableStateFlow(DeviceListUi())
     val pairing = MutableStateFlow(PairingUi())
-    val connectionState = MutableStateFlow(ConnectionState.Disconnected)
-    val connectionError = MutableStateFlow<String?>(null)
+    val connectionState = remoteSession.connectionState
+    val connectionError = remoteSession.connectionError
 
     /** Language choice (persisted); drives the UI strings. */
     val language = MutableStateFlow(AppLanguage.System)
@@ -102,11 +88,11 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
     /** Whether the first-run remote tutorial has already been shown. */
     val introSeen = MutableStateFlow(false)
 
-    /** In-app update settings + state. */
-    val autoCheckUpdates = MutableStateFlow(true)
-    val autoDownloadUpdates = MutableStateFlow(false)
-    val updateState = MutableStateFlow<UpdateState>(UpdateState.Idle)
-    private var updateJob: Job? = null
+    /** Safe lock-screen controls are disabled until the user explicitly opts in. */
+    val lockScreenControls = MutableStateFlow(false)
+
+    /** Human-readable, redacted diagnostics shown in Settings. */
+    val diagnosticsReport = MutableStateFlow("")
 
     // Where to return when leaving Settings (device list or the remote).
     private var settingsReturnTo: Screen = Screen.DeviceList
@@ -124,27 +110,20 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
     private var strings: AppStrings = EnglishStrings
 
     /** Keyboard focus state on the TV (drives auto-open of the soft keyboard). */
-    val keyboardFocus = MutableStateFlow(KeyboardFocusState.Unknown)
+    val keyboardFocus = remoteSession.keyboardFocus
 
     /** The phone-side edit buffer mirrored to the TV text field. */
     val keyboardText = MutableStateFlow("")
 
-    /** Set while the remote screen is active. */
-    var client: CompanionClient? = null
-        private set
     private var pairSetup: PairSetup? = null
     private var pairingConnection: CompanionConnection? = null
-    private var reconnectJob: Job? = null
-    private var keyboardFocusJob: Job? = null
     private var textSyncJob: Job? = null
+    private var isForeground = false
 
     /** Launchable apps (bundle id → name); null until loaded. */
     val apps = MutableStateFlow<List<Pair<String, String>>?>(null)
     val appsError = MutableStateFlow<String?>(null)
 
-    // Touch events must reach the device in order: single consumer channel.
-    private val touchEvents = Channel<Triple<Long, Long, TouchPhase>>(capacity = 256)
-    private var touchJob: Job? = null
     private var lastHoldSentAt = 0L
 
     init {
@@ -173,14 +152,16 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
             settingsRepository.introSeen.collect { introSeen.value = it }
         }
         viewModelScope.launch {
-            settingsRepository.autoCheckUpdates.collect { autoCheckUpdates.value = it }
+            settingsRepository.lockScreenControls.collect { lockScreenControls.value = it }
         }
         viewModelScope.launch {
-            settingsRepository.autoDownloadUpdates.collect { autoDownloadUpdates.value = it }
-        }
-        // One-shot update check on launch, if enabled.
-        viewModelScope.launch {
-            if (settingsRepository.autoCheckUpdates.first()) checkForUpdates(manual = false)
+            remoteSession.keyboardFocus.collect { state ->
+                if (state == KeyboardFocusState.Focused) {
+                    remoteSession.execute { client ->
+                        client.textGet()?.let { keyboardText.value = it }
+                    }
+                }
+            }
         }
         startScan()
     }
@@ -215,63 +196,10 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
         viewModelScope.launch { settingsRepository.setIntroSeen(true) }
     }
 
-    fun setAutoCheckUpdates(enabled: Boolean) {
-        viewModelScope.launch { settingsRepository.setAutoCheckUpdates(enabled) }
-    }
-
-    fun setAutoDownloadUpdates(enabled: Boolean) {
-        viewModelScope.launch { settingsRepository.setAutoDownloadUpdates(enabled) }
-    }
-
-    // In-app updates (GitHub Releases)
-
-    fun checkForUpdates(manual: Boolean) {
-        if (updateState.value is UpdateState.Downloading) return
-        updateJob?.cancel()
-        updateJob = viewModelScope.launch {
-            updateState.value = UpdateState.Checking(manual)
-            val info = runCatching { AppUpdater.check(BuildConfig.VERSION_NAME) }.getOrNull()
-            when {
-                info == null -> updateState.value = if (manual) UpdateState.UpToDate else UpdateState.Idle
-                autoDownloadUpdates.value -> startDownload(info)
-                else -> updateState.value = UpdateState.Available(info)
-            }
-        }
-    }
-
-    fun downloadUpdate() {
-        val info = when (val st = updateState.value) {
-            is UpdateState.Available -> st.info
-            is UpdateState.Failed -> return
-            else -> return
-        }
-        startDownload(info)
-    }
-
-    private fun startDownload(info: UpdateInfo) {
-        updateJob?.cancel()
-        updateJob = viewModelScope.launch {
-            updateState.value = UpdateState.Downloading(info, 0f)
-            runCatching {
-                AppUpdater.download(getApplication(), info) { p ->
-                    updateState.value = UpdateState.Downloading(info, p)
-                }
-            }.onSuccess { file ->
-                updateState.value = UpdateState.Ready(info, file)
-            }.onFailure {
-                updateState.value = UpdateState.Failed(it.message)
-            }
-        }
-    }
-
-    fun installUpdate() {
-        val st = updateState.value as? UpdateState.Ready ?: return
-        runCatching { AppUpdater.install(getApplication(), st.file) }
-    }
-
-    fun dismissUpdate() {
-        updateJob?.cancel()
-        updateState.value = UpdateState.Idle
+    fun setLockScreenControls(enabled: Boolean) {
+        Diagnostics.updateRuntimeState(lockScreenControls = enabled)
+        Diagnostics.record(getApplication(), "settings", "lock_controls_changed", "enabled" to enabled)
+        viewModelScope.launch { settingsRepository.setLockScreenControls(enabled) }
     }
 
     fun openSettings() {
@@ -279,8 +207,29 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
         viewModelScope.launch {
             pairedDevices.value = credentialsRepository.pairedDeviceNames().sorted()
             deviceVerify.value = emptyMap()
+            refreshDiagnostics()
             screen.value = Screen.Settings
         }
+    }
+
+    suspend fun refreshDiagnostics(): String {
+        val report = withContext(Dispatchers.IO) {
+            runCatching {
+                Diagnostics.snapshotReport(getApplication())
+            }.getOrElse { error ->
+                "Diagnostics unavailable (${error.javaClass.simpleName})"
+            }
+        }
+        diagnosticsReport.value = report
+        return report
+    }
+
+    suspend fun clearDiagnostics(): Boolean {
+        val cleared = withContext(Dispatchers.IO) {
+            runCatching { Diagnostics.clear(getApplication()) }.getOrDefault(false)
+        }
+        refreshDiagnostics()
+        return cleared
     }
 
     /** Re-check that a paired device is reachable and its pairing still valid. */
@@ -321,14 +270,21 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
 
     fun closeSettings() {
         // Return to wherever Settings was opened from (device list or remote).
-        screen.value = settingsReturnTo
+        val destination = settingsReturnTo
+        screen.value = destination
+        if (destination is Screen.Remote && isForeground) {
+            remoteSession.setUiOwner(true)
+            if (connectionState.value == ConnectionState.Disconnected) reconnect()
+        }
     }
 
     fun forgetDeviceByName(name: String) {
         viewModelScope.launch {
             credentialsRepository.delete(name)
+            settingsRepository.clearLastDeviceIf(name)
             pairedDevices.value = credentialsRepository.pairedDeviceNames().sorted()
             deviceList.value = deviceList.value.copy(pairedNames = deviceList.value.pairedNames - name)
+            requestRemoteTileRefresh()
         }
     }
 
@@ -337,6 +293,7 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
         viewModelScope.launch {
             val pairedNames = credentialsRepository.pairedDeviceNames().toSet()
             deviceList.value = deviceList.value.copy(scanning = true, pairedNames = pairedNames)
+            requestRemoteTileRefresh()
             runCatching {
                 discovery.scan(durationMs = 6_000) { device ->
                     val current = deviceList.value
@@ -365,12 +322,23 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
         }
     }
 
+    /** Open the most recently paired TV when launched from the shade panel. */
+    fun openLastRemote() {
+        viewModelScope.launch {
+            val device = settingsRepository.lastDevice() ?: return@launch
+            val stored = credentialsRepository.load(device.name) ?: return@launch
+            openRemote(device, HapCredentials.parse(stored))
+        }
+    }
+
     fun forgetDevice(device: DiscoveredAtv) {
         viewModelScope.launch {
             credentialsRepository.delete(device.name)
+            settingsRepository.clearLastDeviceIf(device.name)
             deviceList.value = deviceList.value.copy(
                 pairedNames = deviceList.value.pairedNames - device.name,
             )
+            requestRemoteTileRefresh()
         }
     }
 
@@ -401,6 +369,7 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
             try {
                 val credentials = setup.finishPairing(pin)
                 credentialsRepository.save(device.name, credentials.toString())
+                requestRemoteTileRefresh()
                 pairingConnection?.close()
                 pairingConnection = null
                 pairSetup = null
@@ -426,99 +395,54 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
     private fun openRemote(device: DiscoveredAtv, credentials: HapCredentials) {
         activeDeviceName.value = device.name
         screen.value = Screen.Remote(device)
-        connect(device, credentials)
-    }
-
-    private fun connect(device: DiscoveredAtv, credentials: HapCredentials) {
-        reconnectJob?.cancel()
-        reconnectJob = viewModelScope.launch {
-            connectionState.value = ConnectionState.Connecting
-            connectionError.value = null
-            // Transient "ws error" right after opening the app is common (the
-            // ATV's port rotates, Wi-Fi just woke, etc). Retry a few times,
-            // half a second apart, staying in the Connecting state; only
-            // surface the error + manual Reconnect after all attempts fail.
-            var lastError: Exception? = null
-            repeat(RECONNECT_ATTEMPTS) { attempt ->
-                if (attempt > 0) delay(RECONNECT_DELAY_MS)
-                // The Companion port changes across reboots: re-resolve first,
-                // falling back to the last known host/port (manual entry).
-                val target = discovery.resolveByName(device.name) ?: device
-                try {
-                    val transport = SocketTransport.connect(target.host, target.port)
-                    val newClient = CompanionClient(CompanionConnection(transport), credentials)
-                    newClient.connect()
-                    client = newClient
-                    connectionState.value = ConnectionState.Connected
-                    observeKeyboard(newClient)
-                    consumeTouchEvents(newClient)
-                    return@launch
-                } catch (e: Exception) {
-                    client = null
-                    lastError = e
-                }
-            }
-            connectionState.value = ConnectionState.Disconnected
-            connectionError.value = friendlyError(lastError ?: java.io.IOException("connect failed"))
-        }
+        if (isForeground) remoteSession.setUiOwner(true)
+        apps.value = null
+        appsError.value = null
+        viewModelScope.launch { remoteSession.connect(device, credentials) }
     }
 
     fun reconnect() {
-        val device = (screen.value as? Screen.Remote)?.device ?: return
-        viewModelScope.launch {
-            val stored = credentialsRepository.load(device.name) ?: return@launch
-            connect(device, HapCredentials.parse(stored))
-        }
+        viewModelScope.launch { remoteSession.reconnect() }
     }
 
     /** Called when the remote screen returns to the foreground. */
     fun onForeground() {
-        if (screen.value is Screen.Remote && connectionState.value == ConnectionState.Disconnected) {
-            reconnect()
+        isForeground = true
+        if (screen.value is Screen.Remote) {
+            remoteSession.setUiOwner(true)
+            if (connectionState.value == ConnectionState.Disconnected) reconnect()
         }
+    }
+
+    /** Release a UI-only socket when the app is no longer visible. */
+    fun onBackground() {
+        isForeground = false
+        remoteSession.setUiOwner(false)
     }
 
     fun closeRemote() {
-        reconnectJob?.cancel()
-        val current = client
-        client = null
-        connectionState.value = ConnectionState.Disconnected
         activeDeviceName.value = null
-        viewModelScope.launch { runCatching { current?.disconnect() } }
+        remoteSession.setUiOwner(false)
         screen.value = Screen.DeviceList
     }
 
-    /** Run a remote-control action, flipping to Disconnected on I/O errors. */
-    fun withClient(block: suspend (CompanionClient) -> Unit) {
-        val current = client ?: return
-        viewModelScope.launch {
-            try {
-                block(current)
-            } catch (e: Exception) {
-                connectionState.value = ConnectionState.Disconnected
-                connectionError.value = friendlyError(e)
-            }
-        }
+    private fun requestRemoteTileRefresh() {
+        val app = getApplication<Application>()
+        TileService.requestListeningState(
+            app,
+            ComponentName(app, RemoteTileService::class.java),
+        )
     }
+
+    /** Run a remote-control action, flipping to Disconnected on I/O errors. */
+    fun withClient(block: suspend (dev.companionremote.protocol.client.CompanionClient) -> Unit) =
+        remoteSession.launchCommand(block = block)
 
     fun pressButton(command: HidCommand) = withClient { it.pressButton(command) }
 
     fun holdButton(command: HidCommand) = withClient { it.holdButton(command) }
 
     // Keyboard (M6): mirror the phone's edit buffer to the TV field
-
-    private fun observeKeyboard(newClient: CompanionClient) {
-        keyboardFocusJob?.cancel()
-        keyboardFocusJob = viewModelScope.launch {
-            newClient.keyboardFocus.collect { state ->
-                keyboardFocus.value = state
-                if (state == KeyboardFocusState.Focused) {
-                    // Pre-fill the edit buffer with what's already in the field
-                    runCatching { newClient.textGet() }.getOrNull()?.let { keyboardText.value = it }
-                }
-            }
-        }
-    }
 
     /**
      * Called on every phone-side keystroke. The whole current string is sent
@@ -529,9 +453,8 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
         keyboardText.value = text
         textSyncJob?.cancel()
         textSyncJob = viewModelScope.launch {
-            delay(250)
-            val current = client ?: return@launch
-            runCatching { current.textSet(text) }
+            kotlinx.coroutines.delay(250)
+            remoteSession.execute { it.textSet(text) }
         }
     }
 
@@ -555,15 +478,6 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
 
     // Touchpad (M7)
 
-    private fun consumeTouchEvents(newClient: CompanionClient) {
-        touchJob?.cancel()
-        touchJob = viewModelScope.launch {
-            for ((x, y, phase) in touchEvents) {
-                runCatching { newClient.touchEvent(x, y, phase) }
-            }
-        }
-    }
-
     /** Queue a touch event; Hold events are throttled to ~16 ms like pyatv. */
     fun sendTouch(x: Long, y: Long, phase: TouchPhase) {
         if (phase == TouchPhase.Hold) {
@@ -571,7 +485,7 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
             if (now - lastHoldSentAt < 16) return
             lastHoldSentAt = now
         }
-        touchEvents.trySend(Triple(x, y, phase))
+        remoteSession.queueTouch(x, y, phase)
     }
 
     fun touchTap() = withClient { it.tap() }
@@ -605,11 +519,7 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
 
     override fun onCleared() {
         pairingConnection?.close()
-        client?.close()
-    }
-
-    private companion object {
-        const val RECONNECT_ATTEMPTS = 3
-        const val RECONNECT_DELAY_MS = 500L
+        isForeground = false
+        remoteSession.setUiOwner(false)
     }
 }

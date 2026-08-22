@@ -1,27 +1,38 @@
 package dev.companionremote.app.ui
 
+import android.app.StatusBarManager
+import android.content.ComponentName
+import android.content.Context
+import android.content.Intent
+import android.graphics.drawable.Icon as AndroidIcon
+import android.os.Build
+import android.widget.Toast
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.selection.selectable
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.text.selection.SelectionContainer
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.rounded.ContentCopy
 import androidx.compose.material.icons.rounded.DeleteOutline
+import androidx.compose.material.icons.rounded.Lock
 import androidx.compose.material.icons.rounded.MailOutline
 import androidx.compose.material.icons.rounded.Refresh
 import androidx.compose.material.icons.rounded.Tv
@@ -37,6 +48,7 @@ import androidx.compose.material3.SnackbarHostState
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
 import androidx.compose.material3.TopAppBar
 import androidx.compose.material3.TopAppBarDefaults
 import androidx.compose.runtime.Composable
@@ -49,8 +61,10 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalClipboardManager
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.text.AnnotatedString
+import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import dev.companionremote.app.AppViewModel
@@ -63,6 +77,7 @@ import dev.companionremote.app.i18n.AppLanguage
 import dev.companionremote.app.i18n.FEEDBACK_EMAIL
 import dev.companionremote.app.i18n.LocalAppStrings
 import dev.companionremote.app.theme.skinAccentPreview
+import dev.companionremote.app.quick.RemoteTileService
 import kotlinx.coroutines.launch
 
 @OptIn(ExperimentalMaterial3Api::class)
@@ -75,12 +90,13 @@ fun SettingsScreen(viewModel: AppViewModel) {
     val fetchIcons by viewModel.fetchAppIcons.collectAsState()
     val hapticEnabled by viewModel.hapticEnabled.collectAsState()
     val hapticStrength by viewModel.hapticStrength.collectAsState()
-    val autoCheckUpdates by viewModel.autoCheckUpdates.collectAsState()
-    val autoDownloadUpdates by viewModel.autoDownloadUpdates.collectAsState()
+    val lockScreenControls by viewModel.lockScreenControls.collectAsState()
+    val diagnosticsReport by viewModel.diagnosticsReport.collectAsState()
     val paired by viewModel.pairedDevices.collectAsState()
     val activeDevice by viewModel.activeDeviceName.collectAsState()
     val deviceVerify by viewModel.deviceVerify.collectAsState()
     val clipboard = LocalClipboardManager.current
+    val context = LocalContext.current
     val snackbarHostState = remember { SnackbarHostState() }
     val scope = rememberCoroutineScope()
     val previewHaptic = rememberHapticPreview()
@@ -213,6 +229,133 @@ fun SettingsScreen(viewModel: AppViewModel) {
                 }
             }
 
+            // Quick Settings tile
+            SectionTitle("Quick Settings")
+            SettingsCard {
+                Row(
+                    Modifier.fillMaxWidth().clickable { requestRemoteTile(context) }.padding(16.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    Box(
+                        Modifier.size(40.dp).background(MaterialTheme.colorScheme.primaryContainer, CircleShape),
+                        contentAlignment = Alignment.Center,
+                    ) {
+                        Icon(
+                            Icons.Rounded.Tv,
+                            contentDescription = null,
+                            tint = MaterialTheme.colorScheme.onPrimaryContainer,
+                        )
+                    }
+                    Column(Modifier.padding(start = 16.dp).weight(1f)) {
+                        Text("Add Apple TV tile", style = MaterialTheme.typography.bodyLarge, fontWeight = FontWeight.Medium)
+                        Text(
+                            "Open the Apple-style remote and native media controls.",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        )
+                    }
+                }
+                Row(
+                    Modifier.fillMaxWidth().padding(16.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    Box(
+                        Modifier.size(40.dp).background(MaterialTheme.colorScheme.secondaryContainer, CircleShape),
+                        contentAlignment = Alignment.Center,
+                    ) {
+                        Icon(
+                            Icons.Rounded.Lock,
+                            contentDescription = null,
+                            tint = MaterialTheme.colorScheme.onSecondaryContainer,
+                        )
+                    }
+                    Column(Modifier.padding(start = 16.dp, end = 12.dp).weight(1f)) {
+                        Text(
+                            "Controls on lock screen",
+                            style = MaterialTheme.typography.bodyLarge,
+                            fontWeight = FontWeight.Medium,
+                        )
+                        Text(
+                            "Allows navigation, Play/Pause and volume. Back, OK, Home and power still require unlock.",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        )
+                    }
+                    Switch(
+                        checked = lockScreenControls,
+                        onCheckedChange = viewModel::setLockScreenControls,
+                    )
+                }
+            }
+
+            // A self-service report that can be copied or shared without adb.
+            SectionTitle("Diagnostics")
+            SettingsCard {
+                Text(
+                    "Reproduce the problem, return here, then copy or share this report. It includes the phone model, UTC action times, lock state, and button types — review it before sending.",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    modifier = Modifier.padding(start = 16.dp, end = 16.dp, top = 12.dp),
+                )
+                SelectionContainer {
+                    Text(
+                        diagnosticsReport.ifBlank { "No diagnostics recorded yet." },
+                        style = MaterialTheme.typography.bodySmall,
+                        fontFamily = FontFamily.Monospace,
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .heightIn(min = 88.dp, max = 240.dp)
+                            .verticalScroll(rememberScrollState())
+                            .padding(16.dp),
+                    )
+                }
+                Row(
+                    Modifier.fillMaxWidth().padding(horizontal = 8.dp, vertical = 4.dp),
+                    horizontalArrangement = Arrangement.End,
+                ) {
+                    TextButton(
+                        onClick = {
+                            scope.launch {
+                                val cleared = viewModel.clearDiagnostics()
+                                snackbarHostState.showMessage(
+                                    if (cleared) "Diagnostics cleared" else "Couldn't fully clear diagnostics",
+                                )
+                            }
+                        },
+                        modifier = Modifier.weight(1f),
+                        contentPadding = PaddingValues(horizontal = 8.dp, vertical = 8.dp),
+                    ) {
+                        Text("Clear")
+                    }
+                    TextButton(
+                        onClick = {
+                            scope.launch {
+                                val currentReport = viewModel.refreshDiagnostics()
+                                clipboard.setText(AnnotatedString(currentReport))
+                                snackbarHostState.showMessage("Report copied")
+                            }
+                        },
+                        enabled = diagnosticsReport.isNotBlank(),
+                        modifier = Modifier.weight(1f),
+                        contentPadding = PaddingValues(horizontal = 8.dp, vertical = 8.dp),
+                    ) {
+                        Text("Copy report")
+                    }
+                    TextButton(
+                        onClick = {
+                            scope.launch {
+                                shareDiagnostics(context, viewModel.refreshDiagnostics())
+                            }
+                        },
+                        enabled = diagnosticsReport.isNotBlank(),
+                        modifier = Modifier.weight(1f),
+                        contentPadding = PaddingValues(horizontal = 8.dp, vertical = 8.dp),
+                    ) {
+                        Text("Share report")
+                    }
+                }
+            }
+
             // Feedback
             SectionTitle(s.sendFeedback)
             SettingsCard {
@@ -245,37 +388,6 @@ fun SettingsScreen(viewModel: AppViewModel) {
                 }
             }
 
-            // Updates
-            SectionTitle(s.updates)
-            SettingsCard {
-                ToggleRow(
-                    title = s.autoCheckUpdates,
-                    desc = s.autoCheckUpdatesDesc,
-                    checked = autoCheckUpdates,
-                    onCheckedChange = { viewModel.setAutoCheckUpdates(it) },
-                )
-                ToggleRow(
-                    title = s.autoDownloadUpdates,
-                    desc = s.autoDownloadUpdatesDesc,
-                    checked = autoDownloadUpdates,
-                    onCheckedChange = { viewModel.setAutoDownloadUpdates(it) },
-                )
-                Row(
-                    Modifier.fillMaxWidth().clickable { viewModel.checkForUpdates(manual = true) }
-                        .padding(16.dp),
-                    verticalAlignment = Alignment.CenterVertically,
-                ) {
-                    Column(Modifier.weight(1f)) {
-                        Text(s.checkNow, style = MaterialTheme.typography.bodyLarge, fontWeight = FontWeight.Medium)
-                        Text(
-                            s.currentVersion.format(dev.companionremote.app.BuildConfig.VERSION_NAME),
-                            style = MaterialTheme.typography.bodySmall,
-                            color = MaterialTheme.colorScheme.onSurfaceVariant,
-                        )
-                    }
-                }
-            }
-
             // About
             SectionTitle(s.about)
             Text(
@@ -292,6 +404,33 @@ fun SettingsScreen(viewModel: AppViewModel) {
             )
             Spacer(Modifier.height(24.dp))
         }
+    }
+}
+
+private fun shareDiagnostics(context: Context, report: String) {
+    val sendIntent = Intent(Intent.ACTION_SEND).apply {
+        type = "text/plain"
+        putExtra(Intent.EXTRA_SUBJECT, "CyberRemote diagnostics")
+        putExtra(Intent.EXTRA_TEXT, report)
+    }
+    context.startActivity(Intent.createChooser(sendIntent, "Share diagnostics"))
+}
+
+private fun requestRemoteTile(context: Context) {
+    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+        val manager = context.getSystemService(StatusBarManager::class.java)
+        manager.requestAddTileService(
+            ComponentName(context, RemoteTileService::class.java),
+            "Apple TV",
+            AndroidIcon.createWithResource(context, R.drawable.ic_qs_remote),
+            context.mainExecutor,
+        ) { result ->
+            if (result != StatusBarManager.TILE_ADD_REQUEST_RESULT_TILE_ADDED) {
+                Toast.makeText(context, "You can also add Apple TV from Edit tiles.", Toast.LENGTH_LONG).show()
+            }
+        }
+    } else {
+        Toast.makeText(context, "Pull down twice, tap Edit, then add Apple TV.", Toast.LENGTH_LONG).show()
     }
 }
 

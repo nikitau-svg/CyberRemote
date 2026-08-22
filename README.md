@@ -1,5 +1,13 @@
 # CyberRemote
 
+> **CyberRemote QS fork:** this branch adds an Apple TV Quick Settings tile,
+> a system-hosted compact remote, and an expandable persistent notification remote.
+> It uses a separate package (`dev.companionremote.nikita`), removes the
+> self-updater and APK-install permission, disables Android backup for pairing
+> data, and updates Bouncy Castle. It can be installed beside upstream
+> CyberRemote; pair the Apple TV once in this fork, then add the tile from
+> **Settings → Quick Settings → Add Apple TV tile**.
+
 A free, open-source, ad-free Android remote for Apple TV (tvOS 15+). It speaks Apple's Companion Link protocol directly over your local network — no cloud, no bridge server, no companion daemon, no telemetry. The phone talks straight to the Apple TV.
 
 > CyberRemote is an independent open-source project. It is **not affiliated with, endorsed by, or sponsored by Apple Inc.** "Apple TV" is a trademark of Apple Inc., used here only to describe compatibility.
@@ -24,7 +32,6 @@ A free, open-source, ad-free Android remote for Apple TV (tvOS 15+). It speaks A
 - App list + launch
 - **Themes** — light / dark / follow-system, plus four glass skins (Midnight, Graphite, Aurora, Sunset)
 - **Haptic feedback** — optional button vibration with adjustable strength
-- **In-app updates** — optionally checks GitHub Releases and installs the new APK for you
 - Auto-reconnect with a quick first-run tutorial
 - Pairing with the PIN shown on the TV (HomeKit-style pair-setup); your credentials never leave the phone (encrypted with the Android Keystore)
 

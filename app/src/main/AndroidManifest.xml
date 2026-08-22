@@ -12,8 +12,10 @@
     <uses-permission android:name="android.permission.RECORD_AUDIO" />
     <!-- Button-press vibration feedback (normal permission, auto-granted). -->
     <uses-permission android:name="android.permission.VIBRATE" />
-    <!-- In-app updates: install the APK downloaded from GitHub Releases. -->
-    <uses-permission android:name="android.permission.REQUEST_INSTALL_PACKAGES" />
+    <!-- User-enabled controls in the notification shade. -->
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_CONNECTED_DEVICE" />
 
     <!-- Voice input is optional, so don't gate installation on having a mic. -->
     <uses-feature android:name="android.hardware.microphone" android:required="false" />
@@ -26,9 +28,11 @@
     </queries>
 
     <application
-        android:label="CyberRemote"
+        android:label="CyberRemote QS"
         android:icon="@mipmap/ic_launcher"
         android:theme="@android:style/Theme.Material.NoActionBar"
+        android:allowBackup="false"
+        android:usesCleartextTraffic="false"
         android:supportsRtl="true">
         <activity
             android:name=".MainActivity"
@@ -42,15 +46,43 @@
             </intent-filter>
         </activity>
 
-        <!-- Shares the downloaded update APK with the system installer. -->
-        <provider
-            android:name="androidx.core.content.FileProvider"
-            android:authorities="${applicationId}.fileprovider"
+        <activity
+            android:name=".quick.RemotePanelActivity"
+            android:theme="@style/Theme.CyberRemote.RemotePanel"
             android:exported="false"
-            android:grantUriPermissions="true">
+            android:excludeFromRecents="true"
+            android:autoRemoveFromRecents="true"
+            android:taskAffinity=""
+            android:launchMode="singleTask"
+            android:finishOnTaskLaunch="true" />
+
+        <activity
+            android:name=".quick.FullRemoteActivity"
+            android:theme="@style/Theme.CyberRemote.FullRemote"
+            android:exported="false"
+            android:excludeFromRecents="true"
+            android:autoRemoveFromRecents="true"
+            android:taskAffinity=""
+            android:launchMode="singleTop"
+            android:finishOnTaskLaunch="true" />
+
+        <service
+            android:name=".quick.RemoteControlService"
+            android:exported="false"
+            android:foregroundServiceType="connectedDevice" />
+
+        <service
+            android:name=".quick.RemoteTileService"
+            android:exported="true"
+            android:icon="@drawable/ic_qs_remote"
+            android:label="Apple TV"
+            android:permission="android.permission.BIND_QUICK_SETTINGS_TILE">
+            <intent-filter>
+                <action android:name="android.service.quicksettings.action.QS_TILE" />
+            </intent-filter>
             <meta-data
-                android:name="android.support.FILE_PROVIDER_PATHS"
-                android:resource="@xml/file_paths" />
-        </provider>
+                android:name="android.service.quicksettings.ACTIVE_TILE"
+                android:value="true" />
+        </service>
     </application>
 </manifest>
