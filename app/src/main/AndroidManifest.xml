@@ -3,11 +3,11 @@
 
     <uses-permission android:name="android.permission.INTERNET" />
     <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
-    <!-- Future Android 17 / targetSdk 37 local-network runtime permission.
-         With targetSdk 35 the platform keeps the compatibility behavior; the
-         network gate already fails closed if this permission later becomes
-         required but has not been granted. -->
-    <uses-permission android:name="android.permission.ACCESS_LOCAL_NETWORK" />
+    <!-- Do not declare ACCESS_LOCAL_NETWORK before targetSdk 37. Android 17
+         keeps targetSdk 35 on its compatibility path; declaring the future
+         dangerous permission without a runtime request breaks NSD on some
+         OEM Android 17 builds. Add the declaration and request flow together
+         when the app actually moves to targetSdk 37. -->
     <!-- Required for mDNS discovery: without a MulticastLock, NsdManager
          silently finds nothing on many devices. -->
     <uses-permission android:name="android.permission.CHANGE_WIFI_MULTICAST_STATE" />

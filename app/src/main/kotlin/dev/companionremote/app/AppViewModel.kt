@@ -312,6 +312,13 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
         if (deviceList.value.scanning) return
         viewModelScope.launch {
             val pairedNames = credentialsRepository.pairedDeviceNames().toSet()
+            Diagnostics.record(
+                getApplication(),
+                "discovery",
+                "requested",
+                "user_initiated" to userInitiated,
+                "paired_count" to pairedNames.size,
+            )
             deviceList.value = deviceList.value.copy(scanning = true, pairedNames = pairedNames)
             requestRemoteTileRefresh()
             // First-run discovery is required for pairing. Once credentials
@@ -324,12 +331,19 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
                 null
             }
             if (!userInitiated && pairedNames.isNotEmpty() && authorization == null) {
+                Diagnostics.record(
+                    getApplication(),
+                    "discovery",
+                    "automatic_blocked",
+                    "reason" to Diagnostics.DiagnosticToken("home_binding"),
+                )
                 deviceList.value = deviceList.value.copy(scanning = false)
                 return@launch
             }
             runCatching {
                 discovery.scan(
                     durationMs = 6_000,
+                    network = authorization?.network,
                     authorizationStillValid = { authorization?.isStillValid() != false },
                     serviceNameFilter = { name ->
                         authorization == null || authorization.binding.deviceName == name
@@ -340,8 +354,16 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
                         deviceList.value = current.copy(devices = current.devices + device)
                     }
                 }
+            }.onFailure { error ->
+                Diagnostics.exception(getApplication(), "discovery", "scan", error)
             }
             deviceList.value = deviceList.value.copy(scanning = false)
+            Diagnostics.record(
+                getApplication(),
+                "discovery",
+                "request_finished",
+                "visible_count" to deviceList.value.devices.size,
+            )
         }
     }
 

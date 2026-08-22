@@ -6,6 +6,8 @@ import android.net.nsd.NsdManager
 import android.net.nsd.NsdServiceInfo
 import android.net.wifi.WifiManager
 import android.os.Build
+import dev.companionremote.app.diagnostics.Diagnostics
+import dev.companionremote.app.diagnostics.Diagnostics.DiagnosticToken
 import kotlin.coroutines.resume
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.async
@@ -64,30 +66,69 @@ class AtvDiscovery(context: Context) {
             networkRequested = network != null,
             sdkInt = Build.VERSION.SDK_INT,
         )
+        Diagnostics.record(
+            appContext,
+            "discovery",
+            "scan_entered",
+            "mode" to discoveryMode,
+            "sdk" to Build.VERSION.SDK_INT,
+        )
         // On Android 12L and below, NSD cannot be constrained to a specific
         // Network. Automatic discovery therefore fails closed instead of
         // leaking a browse onto another attached LAN. A null network is an
         // explicit/user-initiated browse and may use the legacy API.
-        if (discoveryMode == NsdDiscoveryMode.UnsupportedScoped) return
+        if (discoveryMode == NsdDiscoveryMode.UnsupportedScoped) {
+            Diagnostics.record(
+                appContext,
+                "discovery",
+                "scan_skipped",
+                "reason" to DiagnosticToken("unsupported_scoped"),
+            )
+            return
+        }
         // Check before acquiring MulticastLock so an unauthorized automatic
         // browse has no radio or battery side effect.
-        if (!authorizationStillValid()) return
-        val multicastLock = wifiManager.createMulticastLock("companion-remote-discovery").apply {
-            setReferenceCounted(false)
-            acquire()
+        if (!authorizationStillValid()) {
+            Diagnostics.record(
+                appContext,
+                "discovery",
+                "scan_skipped",
+                "reason" to DiagnosticToken("authorization"),
+            )
+            return
+        }
+        val multicastLock = wifiManager.createMulticastLock("companion-remote-discovery")
+        try {
+            multicastLock.setReferenceCounted(false)
+            multicastLock.acquire()
+            Diagnostics.record(appContext, "discovery", "multicast_lock_acquired")
+        } catch (error: RuntimeException) {
+            Diagnostics.exception(appContext, "discovery", "multicast_lock", error)
+            return
         }
         val found = LinkedHashMap<String, NsdServiceInfo>()
         val listener = object : NsdManager.DiscoveryListener {
-            override fun onStartDiscoveryFailed(serviceType: String, errorCode: Int) = Unit
-            override fun onStopDiscoveryFailed(serviceType: String, errorCode: Int) = Unit
-            override fun onDiscoveryStarted(serviceType: String) = Unit
-            override fun onDiscoveryStopped(serviceType: String) = Unit
-            override fun onServiceLost(serviceInfo: NsdServiceInfo) = Unit
+            override fun onStartDiscoveryFailed(serviceType: String, errorCode: Int) {
+                Diagnostics.record(appContext, "discovery", "start_failed", "code" to errorCode)
+            }
+            override fun onStopDiscoveryFailed(serviceType: String, errorCode: Int) {
+                Diagnostics.record(appContext, "discovery", "stop_failed", "code" to errorCode)
+            }
+            override fun onDiscoveryStarted(serviceType: String) {
+                Diagnostics.record(appContext, "discovery", "started")
+            }
+            override fun onDiscoveryStopped(serviceType: String) {
+                Diagnostics.record(appContext, "discovery", "stopped")
+            }
+            override fun onServiceLost(serviceInfo: NsdServiceInfo) {
+                Diagnostics.record(appContext, "discovery", "service_lost")
+            }
             override fun onServiceFound(serviceInfo: NsdServiceInfo) {
-                if (
+                val accepted =
                     authorizationStillValid() &&
                     serviceNameFilter(serviceInfo.serviceName)
-                ) {
+                Diagnostics.record(appContext, "discovery", "service_found", "accepted" to accepted)
+                if (accepted) {
                     synchronized(found) { found[serviceInfo.serviceName] = serviceInfo }
                 }
             }
@@ -128,6 +169,13 @@ class AtvDiscovery(context: Context) {
                 if (!authorizationStillValid()) break
                 resolve(pending.value)?.takeIf { authorizationStillValid() }?.let(onDevice)
             }
+            Diagnostics.record(
+                appContext,
+                "discovery",
+                "scan_finished",
+                "found" to synchronized(found) { found.size },
+                "resolved" to resolved.size,
+            )
         } finally {
             runCatching { nsdManager.stopServiceDiscovery(listener) }
             runCatching { multicastLock.release() }
@@ -182,12 +230,14 @@ class AtvDiscovery(context: Context) {
                     info,
                     object : NsdManager.ResolveListener {
                         override fun onResolveFailed(serviceInfo: NsdServiceInfo, errorCode: Int) {
+                            Diagnostics.record(appContext, "discovery", "resolve_failed", "code" to errorCode)
                             if (continuation.isActive) continuation.resume(null)
                         }
 
                         override fun onServiceResolved(serviceInfo: NsdServiceInfo) {
                             val host = serviceInfo.host?.hostAddress
                             if (host == null) {
+                                Diagnostics.record(appContext, "discovery", "resolved", "accepted" to false)
                                 if (continuation.isActive) continuation.resume(null)
                                 return
                             }
@@ -202,10 +252,12 @@ class AtvDiscovery(context: Context) {
                             val isAppleTv = model?.startsWith("AppleTV") == true ||
                                 (model.isNullOrEmpty() && (flags and PAIRABLE_MASK) != 0)
                             if (!isAppleTv) {
+                                Diagnostics.record(appContext, "discovery", "resolved", "accepted" to false)
                                 if (continuation.isActive) continuation.resume(null)
                                 return
                             }
                             if (continuation.isActive) {
+                                Diagnostics.record(appContext, "discovery", "resolved", "accepted" to true)
                                 continuation.resume(
                                     DiscoveredAtv(
                                         name = serviceInfo.serviceName,
