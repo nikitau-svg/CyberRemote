@@ -4,8 +4,6 @@ plugins {
     `java-library`
 }
 
-val protobufCompilerVersion = libs.versions.protobuf.get()
-
 java {
     sourceCompatibility = JavaVersion.VERSION_17
     targetCompatibility = JavaVersion.VERSION_17
@@ -29,7 +27,7 @@ dependencies {
 
 protobuf {
     protoc {
-        artifact = "com.google.protobuf:protoc:$protobufCompilerVersion"
+        artifact = "com.google.protobuf:protoc:4.31.1"
     }
 }
 
