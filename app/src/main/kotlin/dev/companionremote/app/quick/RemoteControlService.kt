@@ -9,6 +9,8 @@ import android.app.Service
 import android.content.ComponentName
 import android.content.Context
 import android.content.Intent
+import android.graphics.Bitmap
+import android.graphics.BitmapFactory
 import android.media.MediaMetadata
 import android.media.session.MediaSession
 import android.media.session.PlaybackState
@@ -18,6 +20,7 @@ import android.os.Bundle
 import android.os.IBinder
 import android.os.SystemClock
 import android.service.quicksettings.TileService
+import dev.companionremote.app.BuildConfig
 import dev.companionremote.app.ConnectionState
 import dev.companionremote.app.R
 import dev.companionremote.app.RemoteSessionManager
@@ -25,14 +28,24 @@ import dev.companionremote.app.data.SettingsRepository
 import dev.companionremote.app.diagnostics.Diagnostics
 import dev.companionremote.app.diagnostics.Diagnostics.DiagnosticToken
 import dev.companionremote.app.diagnostics.Diagnostics.RuntimePlayback
+import dev.companionremote.app.nowplaying.ArtworkPayload
+import dev.companionremote.app.nowplaying.NowPlayingSnapshot
+import dev.companionremote.app.nowplaying.PlaybackCommand
+import dev.companionremote.app.nowplaying.PlaybackStatus
+import dev.companionremote.app.nowplaying.commandFor
+import java.io.ByteArrayOutputStream
+import java.net.HttpURLConnection
+import java.net.URL
 import java.util.UUID
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.flow.combine
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 
 /** Holds the encrypted Apple TV connection and exposes Android-native media controls. */
 class RemoteControlService : Service() {
@@ -40,7 +53,8 @@ class RemoteControlService : Service() {
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
     private val commandQueue = Channel<QueuedAction>(capacity = COMMAND_QUEUE_CAPACITY)
     private val ingressRateLimiter = LockedRemoteRateLimiter { SystemClock.elapsedRealtime() }
-    private var connectJob: kotlinx.coroutines.Job? = null
+    private var connectJob: Job? = null
+    private var artworkJob: Job? = null
     private lateinit var session: RemoteSessionManager
     private lateinit var settings: SettingsRepository
     private lateinit var keyguard: KeyguardManager
@@ -48,13 +62,15 @@ class RemoteControlService : Service() {
     private var foregroundStarted = false
     @Volatile private var acceptingCommands = false
     private var lockScreenControlsEnabled = false
-    private var optimisticPlaying = false
+    private var loadedArtworkId: String? = null
+    private var artworkBitmap: Bitmap? = null
     @Volatile private var capabilityToken = UUID.randomUUID().toString()
     private var lastSnapshot = NotificationSnapshot(
         state = ConnectionState.Disconnected,
         deviceName = null,
         error = null,
         lockScreenControlsEnabled = false,
+        nowPlaying = NowPlayingSnapshot.Disconnected,
     )
 
     override fun onCreate() {
@@ -86,8 +102,9 @@ class RemoteControlService : Service() {
                 session.activeDevice,
                 session.connectionError,
                 settings.lockScreenControls,
-            ) { state, device, error, lockControls ->
-                NotificationSnapshot(state, device?.name, error, lockControls)
+                session.nowPlaying,
+            ) { state, device, error, lockControls, nowPlaying ->
+                NotificationSnapshot(state, device?.name, error, lockControls, nowPlaying)
             }.collect { snapshot ->
                 lastSnapshot = snapshot
                 lockScreenControlsEnabled = snapshot.lockScreenControlsEnabled
@@ -103,7 +120,10 @@ class RemoteControlService : Service() {
                     "connection" to snapshot.state,
                     "lock_controls" to snapshot.lockScreenControlsEnabled,
                     "has_error" to (snapshot.error != null),
+                    "now_playing" to snapshot.nowPlaying.status,
+                    "now_playing_source" to snapshot.nowPlaying.source,
                 )
+                updateArtwork(snapshot.nowPlaying.artwork)
                 updateMediaSession(snapshot)
                 refreshNotification()
                 TileService.requestListeningState(
@@ -214,6 +234,10 @@ class RemoteControlService : Service() {
         commandQueue.close()
         connectJob?.cancel()
         connectJob = null
+        artworkJob?.cancel()
+        artworkJob = null
+        artworkBitmap = null
+        loadedArtworkId = null
         releaseMediaSession()
         Diagnostics.updateRuntimeState(
             serviceRunning = false,
@@ -236,12 +260,12 @@ class RemoteControlService : Service() {
             setCallback(object : MediaSession.Callback() {
                 override fun onPlay() {
                     Diagnostics.record(this@RemoteControlService, "media_session", "callback_play")
-                    if (isControlLeaseActive(leaseToken)) enqueuePlayPause()
+                    if (isControlLeaseActive(leaseToken)) enqueueAction(QuickRemoteAction.Play)
                 }
 
                 override fun onPause() {
                     Diagnostics.record(this@RemoteControlService, "media_session", "callback_pause")
-                    if (isControlLeaseActive(leaseToken)) enqueuePlayPause()
+                    if (isControlLeaseActive(leaseToken)) enqueueAction(QuickRemoteAction.Pause)
                 }
 
                 override fun onStop() {
@@ -284,10 +308,6 @@ class RemoteControlService : Service() {
         mediaSession = null
         Diagnostics.updateRuntimeState(mediaSessionActive = false, playback = RuntimePlayback.Released)
         Diagnostics.record(this, "media_session", "released", "existed" to existed)
-    }
-
-    private fun enqueuePlayPause() {
-        enqueueAction(QuickRemoteAction.PlayPause)
     }
 
     private fun enqueueAction(action: QuickRemoteAction) {
@@ -385,30 +405,46 @@ class RemoteControlService : Service() {
             "success" to succeeded,
             "locked" to queued.wasLockedAtIngress,
         )
-        if (succeeded && action == QuickRemoteAction.PlayPause) {
-            // Companion exposes no Now Playing state. This toggles only the local
-            // button hint and is never presented as authoritative TV metadata.
-            optimisticPlaying = !optimisticPlaying
-            updateMediaSession(lastSnapshot)
-            refreshNotification()
-        }
     }
 
     private fun updateMediaSession(snapshot: NotificationSnapshot) {
         val currentSession = mediaSession ?: return
-        val status = when (snapshot.state) {
-            ConnectionState.Connecting -> "Connecting…"
-            ConnectionState.Connected -> "Connected"
-            ConnectionState.Disconnected -> "Ready to connect"
+        val nowPlaying = snapshot.nowPlaying
+        val fallbackStatus = connectionLabel(snapshot.state)
+        val title = nowPlaying.title ?: "Apple TV Remote"
+        val subtitle = nowPlaying.subtitle() ?: fallbackStatus
+        val metadata = MediaMetadata.Builder()
+            .putString(MediaMetadata.METADATA_KEY_TITLE, title)
+            .putString(MediaMetadata.METADATA_KEY_DISPLAY_TITLE, title)
+            .putString(MediaMetadata.METADATA_KEY_DISPLAY_SUBTITLE, subtitle)
+        nowPlaying.artist?.let {
+            metadata.putString(MediaMetadata.METADATA_KEY_ARTIST, it)
+        }
+        nowPlaying.album?.let {
+            metadata.putString(MediaMetadata.METADATA_KEY_ALBUM, it)
+        }
+        nowPlaying.durationMs?.takeIf { it > 0L }?.let {
+            metadata.putLong(MediaMetadata.METADATA_KEY_DURATION, it)
+        }
+        artworkBitmap?.let {
+            metadata.putBitmap(MediaMetadata.METADATA_KEY_ART, it)
+            metadata.putBitmap(MediaMetadata.METADATA_KEY_ALBUM_ART, it)
+            metadata.putBitmap(MediaMetadata.METADATA_KEY_DISPLAY_ICON, it)
         }
         currentSession.setMetadata(
-            MediaMetadata.Builder()
-                .putString(MediaMetadata.METADATA_KEY_TITLE, "Apple TV Remote")
-                .putString(MediaMetadata.METADATA_KEY_ARTIST, "Remote controls")
-                .putString(MediaMetadata.METADATA_KEY_DISPLAY_TITLE, "Apple TV Remote")
-                .putString(MediaMetadata.METADATA_KEY_DISPLAY_SUBTITLE, status)
-                .build(),
+            metadata.build(),
         )
+        val androidPlaybackState = when (nowPlaying.status) {
+            PlaybackStatus.Playing -> PlaybackState.STATE_PLAYING
+            PlaybackStatus.Buffering -> PlaybackState.STATE_BUFFERING
+            PlaybackStatus.Paused -> PlaybackState.STATE_PAUSED
+            PlaybackStatus.Idle -> PlaybackState.STATE_STOPPED
+            PlaybackStatus.Stopped -> PlaybackState.STATE_STOPPED
+            PlaybackStatus.Unknown -> PlaybackState.STATE_PAUSED
+        }
+        val position = nowPlaying.positionAt(SystemClock.elapsedRealtime())
+            ?: PlaybackState.PLAYBACK_POSITION_UNKNOWN
+        val speed = if (nowPlaying.status == PlaybackStatus.Playing) 1f else 0f
         currentSession.setPlaybackState(
             PlaybackState.Builder()
                 .setActions(
@@ -419,13 +455,17 @@ class RemoteControlService : Service() {
                 .addCustomAction(MEDIA_VOLUME_DOWN, "Volume down", R.drawable.ic_volume_down)
                 .addCustomAction(MEDIA_VOLUME_UP, "Volume up", R.drawable.ic_volume_up)
                 .setState(
-                    if (optimisticPlaying) PlaybackState.STATE_PLAYING else PlaybackState.STATE_PAUSED,
-                    PlaybackState.PLAYBACK_POSITION_UNKNOWN,
-                    1f,
+                    androidPlaybackState,
+                    position,
+                    speed,
                 )
                 .build(),
         )
-        val playback = if (optimisticPlaying) RuntimePlayback.Playing else RuntimePlayback.Paused
+        val playback = when (nowPlaying.status) {
+            PlaybackStatus.Playing -> RuntimePlayback.Playing
+            PlaybackStatus.Paused -> RuntimePlayback.Paused
+            else -> RuntimePlayback.Unknown
+        }
         Diagnostics.updateRuntimeState(
             mediaSessionActive = currentSession.isActive,
             playback = playback,
@@ -439,7 +479,99 @@ class RemoteControlService : Service() {
             "state_updated",
             "playback" to playback,
             "connection" to snapshot.state,
+            "source" to nowPlaying.source,
+            "has_metadata" to (nowPlaying.title != null),
+            "has_artwork" to (artworkBitmap != null),
         )
+    }
+
+    /** Decode/fetch artwork once per media item; state pushes never poll the TV. */
+    private fun updateArtwork(payload: ArtworkPayload?) {
+        if (payload?.id == loadedArtworkId) return
+        artworkJob?.cancel()
+        artworkJob = null
+        loadedArtworkId = payload?.id
+        artworkBitmap = null
+        if (payload == null) return
+
+        artworkJob = scope.launch(Dispatchers.IO) {
+            val bitmap = payload.data?.let(::decodeArtwork)
+                ?: payload.urlTemplate?.let(::downloadArtwork)
+            withContext(Dispatchers.Main.immediate) {
+                if (lastSnapshot.nowPlaying.artwork?.id != payload.id) return@withContext
+                artworkBitmap = bitmap
+                Diagnostics.record(
+                    this@RemoteControlService,
+                    "now_playing",
+                    "artwork_loaded",
+                    "success" to (bitmap != null),
+                    "embedded" to (payload.data != null),
+                )
+                updateMediaSession(lastSnapshot)
+                refreshNotification()
+            }
+        }
+    }
+
+    private fun downloadArtwork(template: String): Bitmap? {
+        val rendered = template
+            .replace("{w}", ARTWORK_EDGE_PX.toString())
+            .replace("{h}", ARTWORK_EDGE_PX.toString())
+            .replace("{f}", "jpg")
+            .replace("{c}", "bb")
+        val url = runCatching { URL(rendered) }.getOrNull() ?: return null
+        // Keep the app's cleartext policy intact. Embedded/local MRP artwork is
+        // handled without HTTP; remote templates must be HTTPS.
+        if (url.protocol != "https") return null
+        val connection = (url.openConnection() as? HttpURLConnection) ?: return null
+        return try {
+            connection.instanceFollowRedirects = true
+            connection.connectTimeout = ARTWORK_TIMEOUT_MS
+            connection.readTimeout = ARTWORK_TIMEOUT_MS
+            connection.setRequestProperty("User-Agent", "CyberRemote/${BuildConfig.VERSION_NAME}")
+            connection.connect()
+            if (connection.responseCode !in 200..299) return null
+            val contentLength = connection.contentLengthLong
+            if (contentLength > MAX_ARTWORK_BYTES) return null
+            val bytes = connection.inputStream.use { input ->
+                val output = ByteArrayOutputStream(
+                    contentLength.takeIf { it in 1..MAX_ARTWORK_BYTES }
+                        ?.toInt()
+                        ?: DEFAULT_ARTWORK_BUFFER_BYTES,
+                )
+                val buffer = ByteArray(8 * 1024)
+                var total = 0
+                while (true) {
+                    val count = input.read(buffer)
+                    if (count < 0) break
+                    total += count
+                    if (total > MAX_ARTWORK_BYTES) return null
+                    output.write(buffer, 0, count)
+                }
+                output.toByteArray()
+            }
+            decodeArtwork(bytes)
+        } catch (_: Exception) {
+            null
+        } finally {
+            connection.disconnect()
+        }
+    }
+
+    private fun decodeArtwork(bytes: ByteArray): Bitmap? {
+        if (bytes.isEmpty() || bytes.size > MAX_ARTWORK_BYTES) return null
+        val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
+        BitmapFactory.decodeByteArray(bytes, 0, bytes.size, bounds)
+        if (bounds.outWidth <= 0 || bounds.outHeight <= 0) return null
+        var sampleSize = 1
+        while (
+            bounds.outWidth / sampleSize > ARTWORK_EDGE_PX * 2 ||
+            bounds.outHeight / sampleSize > ARTWORK_EDGE_PX * 2
+        ) {
+            sampleSize *= 2
+        }
+        val options = BitmapFactory.Options().apply { inSampleSize = sampleSize }
+        return BitmapFactory.decodeByteArray(bytes, 0, bytes.size, options)
     }
 
     private fun ensureForeground() {
@@ -464,7 +596,7 @@ class RemoteControlService : Service() {
                     this,
                     lastSnapshot,
                     currentSession.sessionToken,
-                    optimisticPlaying,
+                    artworkBitmap,
                     capabilityToken,
                 ),
             )
@@ -487,7 +619,7 @@ class RemoteControlService : Service() {
                     this,
                     lastSnapshot,
                     currentSession.sessionToken,
-                    optimisticPlaying,
+                    artworkBitmap,
                     capabilityToken,
                 ),
             )
@@ -504,6 +636,10 @@ class RemoteControlService : Service() {
         acceptingCommands = false
         connectJob?.cancel()
         connectJob = null
+        artworkJob?.cancel()
+        artworkJob = null
+        artworkBitmap = null
+        loadedArtworkId = null
         releaseMediaSession()
         revokeCapabilities()
         foregroundStarted = false
@@ -553,6 +689,10 @@ class RemoteControlService : Service() {
         private const val UNLOCKED_COMMAND_MAX_AGE_MS = 3_000L
         private const val MEDIA_VOLUME_DOWN = "dev.companionremote.media.VOLUME_DOWN"
         private const val MEDIA_VOLUME_UP = "dev.companionremote.media.VOLUME_UP"
+        private const val ARTWORK_EDGE_PX = 512
+        private const val ARTWORK_TIMEOUT_MS = 4_000
+        private const val MAX_ARTWORK_BYTES = 3L * 1024 * 1024
+        private const val DEFAULT_ARTWORK_BUFFER_BYTES = 32 * 1024
 
         fun start(context: Context, expectedCapability: String? = null) {
             Diagnostics.record(
@@ -608,11 +748,29 @@ private data class QueuedAction(
     val capabilityToken: String,
 )
 
+private fun connectionLabel(state: ConnectionState): String = when (state) {
+    ConnectionState.Connecting -> "Connecting…"
+    ConnectionState.Connected -> "Connected"
+    ConnectionState.Disconnected -> "Ready to connect"
+}
+
+private fun NowPlayingSnapshot.subtitle(): String? {
+    val episode = buildList {
+        seasonNumber?.let { add("S$it") }
+        episodeNumber?.let { add("E$it") }
+    }.joinToString(" ").ifBlank { null }
+    val show = listOfNotNull(seriesName, episode).joinToString(" · ").ifBlank { null }
+    return show
+        ?: listOfNotNull(artist, album).distinct().joinToString(" · ").ifBlank { null }
+        ?: appName
+}
+
 private data class NotificationSnapshot(
     val state: ConnectionState,
     val deviceName: String?,
     val error: String?,
     val lockScreenControlsEnabled: Boolean,
+    val nowPlaying: NowPlayingSnapshot,
 )
 
 private object RemoteNotification {
@@ -648,20 +806,27 @@ private object RemoteNotification {
         context: Context,
         snapshot: NotificationSnapshot,
         token: MediaSession.Token,
-        optimisticPlaying: Boolean,
+        artwork: Bitmap?,
         capabilityToken: String,
     ): Notification {
-        val status = when (snapshot.state) {
+        val nowPlaying = snapshot.nowPlaying
+        val title = nowPlaying.title ?: "Apple TV Remote"
+        val status = nowPlaying.subtitle() ?: when (snapshot.state) {
             ConnectionState.Connecting -> "Connecting…"
             ConnectionState.Connected -> "Connected · tap to open remote"
             ConnectionState.Disconnected -> "Tap to connect"
         }
+        val playbackAction = when (commandFor(nowPlaying)) {
+            PlaybackCommand.Play -> Triple("Play", QuickRemoteAction.Play, 111)
+            PlaybackCommand.Pause -> Triple("Pause", QuickRemoteAction.Pause, 111)
+            PlaybackCommand.Toggle -> Triple("Play/Pause", QuickRemoteAction.PlayPause, 111)
+        }
         val controlsUnlocked = snapshot.lockScreenControlsEnabled
         val builder = Notification.Builder(context, CHANNEL_ID)
             .setSmallIcon(R.drawable.ic_qs_remote)
-            .setContentTitle("Apple TV Remote")
+            .setContentTitle(title)
             .setContentText(status)
-            .setSubText("CyberRemote")
+            .setSubText(nowPlaying.appName ?: "CyberRemote")
             .setContentIntent(remoteIntent(context, 901, capabilityToken))
             .setDeleteIntent(
                 serviceIntent(
@@ -682,8 +847,11 @@ private object RemoteNotification {
             .addAction(
                 commandAction(
                     context, R.drawable.ic_play_pause,
-                    if (optimisticPlaying) "Pause" else "Play",
-                    QuickRemoteAction.PlayPause, 111, !controlsUnlocked, capabilityToken,
+                    playbackAction.first,
+                    playbackAction.second,
+                    playbackAction.third,
+                    !controlsUnlocked,
+                    capabilityToken,
                 ),
             )
             .addAction(
@@ -715,6 +883,8 @@ private object RemoteNotification {
             .setOngoing(true)
             .setOnlyAlertOnce(true)
             .setShowWhen(false)
+
+        artwork?.let { builder.setLargeIcon(it) }
 
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
             builder.setForegroundServiceBehavior(Notification.FOREGROUND_SERVICE_IMMEDIATE)

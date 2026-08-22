@@ -1,0 +1,10 @@
+syntax = "proto2";
+option java_package = "dev.companionremote.protocol.mrp.proto";
+option java_multiple_files = true;
+
+
+message PlaybackQueueCapabilities {
+  optional bool requestByRange = 1;
+  optional bool requestByIdentifiers = 2;
+  optional bool requestByRequest = 3;
+}

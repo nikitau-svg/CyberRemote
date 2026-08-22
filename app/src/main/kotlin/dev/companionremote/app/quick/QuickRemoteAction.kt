@@ -13,6 +13,8 @@ enum class QuickRemoteAction(val wireValue: String) {
     Back("back"),
     Home("home"),
     HomeHold("home_hold"),
+    Play("play"),
+    Pause("pause"),
     PlayPause("play_pause"),
     VolumeUp("volume_up"),
     VolumeDown("volume_down"),
@@ -42,6 +44,8 @@ enum class QuickRemoteAction(val wireValue: String) {
             Back -> client.pressButton(HidCommand.Menu)
             Home -> client.pressButton(HidCommand.Home)
             HomeHold -> client.holdButton(HidCommand.Home)
+            Play -> client.play()
+            Pause -> client.pause()
             PlayPause -> client.pressButton(HidCommand.PlayPause)
             VolumeUp -> client.pressButton(HidCommand.VolumeUp)
             VolumeDown -> client.pressButton(HidCommand.VolumeDown)

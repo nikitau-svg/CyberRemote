@@ -8,6 +8,44 @@ package dev.companionremote.protocol.plist
 object KeyedArchiver {
 
     /**
+     * Decode the root object of an NSKeyedArchiver payload and recursively
+     * resolve UID references. Unknown classes remain ordinary maps, which is
+     * useful for forward-compatible Companion events such as NowPlayingInfo.
+     */
+    fun unarchiveRoot(archive: ByteArray): Any? {
+        val archiveRoot = runCatching { BinaryPlist.decode(archive) }.getOrNull() as? Map<*, *>
+            ?: return null
+        val objects = archiveRoot["\$objects"] as? List<Any?> ?: return null
+        val top = archiveRoot["\$top"] as? Map<*, *> ?: return null
+        val rootReference = top["root"] ?: top.values.firstOrNull() ?: return null
+        val resolving = mutableSetOf<Int>()
+
+        fun resolve(value: Any?): Any? = when (value) {
+            is PlistUid -> {
+                val index = value.value.toInt()
+                if (index == 0 && objects.firstOrNull() == "\$null") {
+                    null
+                } else if (index !in objects.indices || !resolving.add(index)) {
+                    null
+                } else {
+                    try {
+                        resolve(objects[index])
+                    } finally {
+                        resolving.remove(index)
+                    }
+                }
+            }
+            is Map<*, *> -> value.entries.associate { (key, nested) ->
+                resolve(key) to resolve(nested)
+            }
+            is List<*> -> value.map(::resolve)
+            else -> value
+        }
+
+        return resolve(rootReference)
+    }
+
+    /**
      * Read properties from a keyed archive by following UID references,
      * starting at `$top`. Returns null for a path that doesn't resolve.
      */

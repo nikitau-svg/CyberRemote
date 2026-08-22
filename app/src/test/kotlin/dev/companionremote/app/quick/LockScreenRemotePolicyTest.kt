@@ -35,6 +35,8 @@ class LockScreenRemotePolicyTest {
             QuickRemoteAction.Down,
             QuickRemoteAction.Left,
             QuickRemoteAction.Right,
+            QuickRemoteAction.Play,
+            QuickRemoteAction.Pause,
             QuickRemoteAction.PlayPause,
             QuickRemoteAction.VolumeUp,
             QuickRemoteAction.VolumeDown,
@@ -53,9 +55,9 @@ class LockScreenRemotePolicyTest {
 
         assertTrue(limiter.tryAcquire(QuickRemoteAction.PlayPause))
         now = 200L
-        assertFalse(limiter.tryAcquire(QuickRemoteAction.PlayPause))
+        assertFalse(limiter.tryAcquire(QuickRemoteAction.Play))
         now = 351L
-        assertTrue(limiter.tryAcquire(QuickRemoteAction.PlayPause))
+        assertTrue(limiter.tryAcquire(QuickRemoteAction.Pause))
 
         repeat(6) { index ->
             now = 400L + index * 115L

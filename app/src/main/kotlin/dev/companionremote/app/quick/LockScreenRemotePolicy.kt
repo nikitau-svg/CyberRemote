@@ -11,6 +11,8 @@ object LockScreenRemotePolicy {
         QuickRemoteAction.Down,
         QuickRemoteAction.Left,
         QuickRemoteAction.Right,
+        QuickRemoteAction.Play,
+        QuickRemoteAction.Pause,
         QuickRemoteAction.PlayPause,
         QuickRemoteAction.VolumeUp,
         QuickRemoteAction.VolumeDown,
@@ -31,6 +33,7 @@ class LockedRemoteRateLimiter(
 ) {
     private val recent = ArrayDeque<Long>()
     private val lastByAction = mutableMapOf<QuickRemoteAction, Long>()
+    private var lastTransportAction: Long? = null
 
     @Synchronized
     fun tryAcquire(action: QuickRemoteAction): Boolean {
@@ -40,8 +43,11 @@ class LockedRemoteRateLimiter(
         }
         if (recent.size >= MAX_ACTIONS_PER_WINDOW) return false
 
-        val last = lastByAction[action]
-        val minimumGap = if (action == QuickRemoteAction.PlayPause) {
+        val isTransportAction = action == QuickRemoteAction.Play ||
+            action == QuickRemoteAction.Pause ||
+            action == QuickRemoteAction.PlayPause
+        val last = if (isTransportAction) lastTransportAction else lastByAction[action]
+        val minimumGap = if (isTransportAction) {
             PLAY_PAUSE_GAP_MS
         } else {
             REPEATED_ACTION_GAP_MS
@@ -50,6 +56,7 @@ class LockedRemoteRateLimiter(
 
         recent.addLast(now)
         lastByAction[action] = now
+        if (isTransportAction) lastTransportAction = now
         return true
     }
 

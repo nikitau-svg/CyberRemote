@@ -8,6 +8,7 @@ import androidx.lifecycle.viewModelScope
 import dev.companionremote.app.data.AppSkin
 import dev.companionremote.app.data.CredentialsRepository
 import dev.companionremote.app.data.HapticStrength
+import dev.companionremote.app.data.HomeNetworkRepository
 import dev.companionremote.app.data.SettingsRepository
 import dev.companionremote.app.data.ThemeMode
 import dev.companionremote.app.discovery.AtvDiscovery
@@ -61,6 +62,7 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
     private val discovery = AtvDiscovery(application)
     private val credentialsRepository = CredentialsRepository(application)
     private val settingsRepository = SettingsRepository(application)
+    private val homeNetworkRepository = HomeNetworkRepository(application)
     private val remoteSession = RemoteSessionManager.get(application)
 
     val screen = MutableStateFlow<Screen>(Screen.DeviceList)
@@ -163,7 +165,7 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
                 }
             }
         }
-        startScan()
+        startScan(userInitiated = false)
     }
 
     // Settings
@@ -247,7 +249,15 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
                 return@launch
             }
             val creds = HapCredentials.parse(stored)
-            val target = discovery.resolveByName(name)
+            val authorization = homeNetworkRepository.automaticAuthorization(creds.atvId)
+            if (authorization == null) {
+                setVerify(name, DeviceVerify.Failed)
+                return@launch
+            }
+            val target = discovery.resolveByName(
+                name = name,
+                authorizationStillValid = authorization::isStillValid,
+            )
             if (target == null) {
                 setVerify(name, DeviceVerify.Failed)
                 return@launch
@@ -281,21 +291,40 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
     fun forgetDeviceByName(name: String) {
         viewModelScope.launch {
             credentialsRepository.delete(name)
-            settingsRepository.clearLastDeviceIf(name)
+            homeNetworkRepository.clearIfDeviceName(name)
             pairedDevices.value = credentialsRepository.pairedDeviceNames().sorted()
             deviceList.value = deviceList.value.copy(pairedNames = deviceList.value.pairedNames - name)
             requestRemoteTileRefresh()
         }
     }
 
-    fun startScan() {
+    fun startScan(userInitiated: Boolean = true) {
         if (deviceList.value.scanning) return
         viewModelScope.launch {
             val pairedNames = credentialsRepository.pairedDeviceNames().toSet()
             deviceList.value = deviceList.value.copy(scanning = true, pairedNames = pairedNames)
             requestRemoteTileRefresh()
+            // First-run discovery is required for pairing. Once credentials
+            // exist, an automatic browse needs a short-lived capability for
+            // the bound LAN. A manual refresh remains available for pairing a
+            // new TV or explicitly moving an existing TV to another LAN.
+            val authorization = if (!userInitiated && pairedNames.isNotEmpty()) {
+                homeNetworkRepository.automaticAuthorization()
+            } else {
+                null
+            }
+            if (!userInitiated && pairedNames.isNotEmpty() && authorization == null) {
+                deviceList.value = deviceList.value.copy(scanning = false)
+                return@launch
+            }
             runCatching {
-                discovery.scan(durationMs = 6_000) { device ->
+                discovery.scan(
+                    durationMs = 6_000,
+                    authorizationStillValid = { authorization?.isStillValid() != false },
+                    serviceNameFilter = { name ->
+                        authorization == null || authorization.binding.deviceName == name
+                    },
+                ) { device ->
                     val current = deviceList.value
                     if (current.devices.none { it.name == device.name }) {
                         deviceList.value = current.copy(devices = current.devices + device)
@@ -315,7 +344,14 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
         viewModelScope.launch {
             val stored = credentialsRepository.load(device.name)
             if (stored != null) {
-                openRemote(device, HapCredentials.parse(stored))
+                // This path follows an explicit tap on a device found by a
+                // user-requested browse. HAP pair-verify must succeed before
+                // the LAN binding is created or moved.
+                openRemote(
+                    device,
+                    HapCredentials.parse(stored),
+                    establishHomeBindingOnSuccess = true,
+                )
             } else {
                 beginPairing(device)
             }
@@ -325,7 +361,8 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
     /** Open the most recently paired TV when launched from the shade panel. */
     fun openLastRemote() {
         viewModelScope.launch {
-            val device = settingsRepository.lastDevice() ?: return@launch
+            val authorization = homeNetworkRepository.automaticAuthorization() ?: return@launch
+            val device = homeNetworkRepository.device(authorization.binding)
             val stored = credentialsRepository.load(device.name) ?: return@launch
             openRemote(device, HapCredentials.parse(stored))
         }
@@ -334,7 +371,7 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
     fun forgetDevice(device: DiscoveredAtv) {
         viewModelScope.launch {
             credentialsRepository.delete(device.name)
-            settingsRepository.clearLastDeviceIf(device.name)
+            homeNetworkRepository.clearIfDeviceName(device.name)
             deviceList.value = deviceList.value.copy(
                 pairedNames = deviceList.value.pairedNames - device.name,
             )
@@ -369,11 +406,16 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
             try {
                 val credentials = setup.finishPairing(pin)
                 credentialsRepository.save(device.name, credentials.toString())
+                val homeBound = homeNetworkRepository.bind(device, credentials.atvId)
                 requestRemoteTileRefresh()
                 pairingConnection?.close()
                 pairingConnection = null
                 pairSetup = null
-                openRemote(device, credentials)
+                openRemote(
+                    device,
+                    credentials,
+                    establishHomeBindingOnSuccess = !homeBound,
+                )
             } catch (e: Exception) {
                 pairing.value = PairingUi(working = false, error = friendlyError(e))
                 pairingConnection?.close()
@@ -392,13 +434,23 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
 
     // Remote / connection lifecycle
 
-    private fun openRemote(device: DiscoveredAtv, credentials: HapCredentials) {
+    private fun openRemote(
+        device: DiscoveredAtv,
+        credentials: HapCredentials,
+        establishHomeBindingOnSuccess: Boolean = false,
+    ) {
         activeDeviceName.value = device.name
         screen.value = Screen.Remote(device)
         if (isForeground) remoteSession.setUiOwner(true)
         apps.value = null
         appsError.value = null
-        viewModelScope.launch { remoteSession.connect(device, credentials) }
+        viewModelScope.launch {
+            if (establishHomeBindingOnSuccess) {
+                remoteSession.connectUserSelected(device, credentials)
+            } else {
+                remoteSession.connect(device, credentials)
+            }
+        }
     }
 
     fun reconnect() {

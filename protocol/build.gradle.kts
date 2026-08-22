@@ -1,5 +1,6 @@
 plugins {
     alias(libs.plugins.kotlin.jvm)
+    alias(libs.plugins.protobuf)
     `java-library`
 }
 
@@ -16,11 +17,18 @@ kotlin {
 
 dependencies {
     api(libs.kotlinx.coroutines.core)
+    api(libs.protobuf.java)
     implementation(libs.bouncycastle.bcprov)
 
     testImplementation(libs.junit.jupiter)
     testImplementation(libs.kotlinx.coroutines.test)
     testRuntimeOnly(libs.junit.platform.launcher)
+}
+
+protobuf {
+    protoc {
+        artifact = "com.google.protobuf:protoc:${libs.versions.protobuf.get()}"
+    }
 }
 
 tasks.test {

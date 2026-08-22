@@ -1,0 +1,17 @@
+syntax = "proto2";
+option java_package = "dev.companionremote.protocol.mrp.proto";
+option java_multiple_files = true;
+
+
+import "pyatv/protocols/mrp/protobuf/ProtocolMessage.proto";
+import "pyatv/protocols/mrp/protobuf/ContentItem.proto";
+import "pyatv/protocols/mrp/protobuf/PlayerPath.proto";
+
+extend ProtocolMessage {
+  optional UpdateContentItemArtworkMessage updateContentItemArtworkMessage = 61;
+}
+
+message UpdateContentItemArtworkMessage {
+  repeated ContentItem contentItems = 1;
+  optional PlayerPath playerPath = 2;
+}

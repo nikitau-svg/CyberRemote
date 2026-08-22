@@ -6,8 +6,9 @@ import android.net.nsd.NsdServiceInfo
 import android.net.wifi.WifiManager
 import kotlin.coroutines.resume
 import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.async
 import kotlinx.coroutines.coroutineScope
-import kotlinx.coroutines.launch
+import kotlinx.coroutines.selects.select
 import kotlinx.coroutines.suspendCancellableCoroutine
 import kotlinx.coroutines.withTimeoutOrNull
 
@@ -34,7 +35,15 @@ class AtvDiscovery(context: Context) {
      * Resolution happens sequentially (NsdManager allows one resolve at a
      * time on older Android versions).
      */
-    suspend fun scan(durationMs: Long = 6_000, onDevice: (DiscoveredAtv) -> Unit) {
+    suspend fun scan(
+        durationMs: Long = 6_000,
+        authorizationStillValid: () -> Boolean = { true },
+        serviceNameFilter: (String) -> Boolean = { true },
+        onDevice: (DiscoveredAtv) -> Unit,
+    ) {
+        // Check before acquiring MulticastLock so an unauthorized automatic
+        // browse has no radio or battery side effect.
+        if (!authorizationStillValid()) return
         val multicastLock = wifiManager.createMulticastLock("companion-remote-discovery").apply {
             setReferenceCounted(false)
             acquire()
@@ -47,7 +56,12 @@ class AtvDiscovery(context: Context) {
             override fun onDiscoveryStopped(serviceType: String) = Unit
             override fun onServiceLost(serviceInfo: NsdServiceInfo) = Unit
             override fun onServiceFound(serviceInfo: NsdServiceInfo) {
-                synchronized(found) { found[serviceInfo.serviceName] = serviceInfo }
+                if (
+                    authorizationStillValid() &&
+                    serviceNameFilter(serviceInfo.serviceName)
+                ) {
+                    synchronized(found) { found[serviceInfo.serviceName] = serviceInfo }
+                }
             }
         }
 
@@ -55,7 +69,7 @@ class AtvDiscovery(context: Context) {
             nsdManager.discoverServices(SERVICE_TYPE, NsdManager.PROTOCOL_DNS_SD, listener)
             val deadline = System.currentTimeMillis() + durationMs
             val resolved = mutableSetOf<String>()
-            while (System.currentTimeMillis() < deadline) {
+            while (System.currentTimeMillis() < deadline && authorizationStillValid()) {
                 val pending = synchronized(found) {
                     found.entries.firstOrNull { it.key !in resolved }
                 }
@@ -64,7 +78,8 @@ class AtvDiscovery(context: Context) {
                     continue
                 }
                 resolved.add(pending.key)
-                resolve(pending.value)?.let(onDevice)
+                if (!authorizationStillValid()) break
+                resolve(pending.value)?.takeIf { authorizationStillValid() }?.let(onDevice)
             }
         } finally {
             runCatching { nsdManager.stopServiceDiscovery(listener) }
@@ -77,16 +92,34 @@ class AtvDiscovery(context: Context) {
      * soon as it is found. The Companion port is ephemeral (changes after
      * reboot) so this runs on every connect.
      */
-    suspend fun resolveByName(name: String, timeoutMs: Long = 6_000): DiscoveredAtv? =
+    suspend fun resolveByName(
+        name: String,
+        timeoutMs: Long = 6_000,
+        authorizationStillValid: () -> Boolean = { true },
+    ): DiscoveredAtv? =
         withTimeoutOrNull(timeoutMs) {
+            if (!authorizationStillValid()) return@withTimeoutOrNull null
             coroutineScope {
                 val found = CompletableDeferred<DiscoveredAtv>()
-                val scanJob = launch {
-                    scan(timeoutMs) { device ->
-                        if (device.name == name) found.complete(device)
+                val scanJob = async {
+                    scan(
+                        durationMs = timeoutMs,
+                        authorizationStillValid = authorizationStillValid,
+                        serviceNameFilter = { it == name },
+                    ) { device ->
+                        if (
+                            authorizationStillValid() &&
+                            device.name == name &&
+                            !found.isCompleted
+                        ) {
+                            found.complete(device)
+                        }
                     }
                 }
-                val device = found.await()
+                val device = select {
+                    found.onAwait { it }
+                    scanJob.onAwait { null }
+                }
                 scanJob.cancel()
                 device
             }

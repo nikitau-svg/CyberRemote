@@ -1,0 +1,14 @@
+syntax = "proto2";
+option java_package = "dev.companionremote.protocol.mrp.proto";
+option java_multiple_files = true;
+
+
+import "pyatv/protocols/mrp/protobuf/Origin.proto";
+import "pyatv/protocols/mrp/protobuf/NowPlayingClient.proto";
+import "pyatv/protocols/mrp/protobuf/NowPlayingPlayer.proto";
+
+message PlayerPath {
+  optional Origin origin = 1;
+  optional NowPlayingClient client = 2;
+  optional NowPlayingPlayer player = 3;
+}

@@ -6,7 +6,6 @@ import androidx.datastore.preferences.core.edit
 import androidx.datastore.preferences.core.intPreferencesKey
 import androidx.datastore.preferences.core.stringPreferencesKey
 import androidx.datastore.preferences.preferencesDataStore
-import dev.companionremote.app.discovery.DiscoveredAtv
 import dev.companionremote.app.i18n.AppLanguage
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.first
@@ -35,6 +34,10 @@ class SettingsRepository(context: Context) {
     private val hapticStrengthKey = stringPreferencesKey("haptic_strength")
     private val introSeenKey = booleanPreferencesKey("intro_seen")
     private val lockScreenControlsKey = booleanPreferencesKey("lock_screen_controls")
+    private val homeNetworkBindingKey = stringPreferencesKey("home_network_binding_v1")
+
+    // Removed once a secure home binding is written. They are intentionally
+    // never used for automatic connection because they predate LAN binding.
     private val lastDeviceNameKey = stringPreferencesKey("last_device_name")
     private val lastDeviceHostKey = stringPreferencesKey("last_device_host")
     private val lastDevicePortKey = intPreferencesKey("last_device_port")
@@ -149,25 +152,50 @@ class SettingsRepository(context: Context) {
         appContext.settingsDataStore.edit { prefs -> prefs[lockScreenControlsKey] = enabled }
     }
 
-    /** Last successfully connected device, including its cached Companion port. */
-    suspend fun lastDevice(): DiscoveredAtv? {
+    /** Encrypted endpoint plus keyed LAN/device fingerprints. */
+    suspend fun homeNetworkBinding(): HomeNetworkBinding? {
         val prefs = appContext.settingsDataStore.data.first()
-        val name = prefs[lastDeviceNameKey] ?: return null
-        val host = prefs[lastDeviceHostKey] ?: return null
-        val port = prefs[lastDevicePortKey] ?: return null
-        return DiscoveredAtv(name = name, host = host, port = port, model = null)
+        val wrapped = prefs[homeNetworkBindingKey]
+        if (wrapped == null) {
+            // A pre-binding build stored this endpoint in plaintext. It is not
+            // safe input for automatic access and is no longer needed: the
+            // user can explicitly refresh once to authenticate and bind it.
+            if (
+                prefs[lastDeviceNameKey] != null ||
+                prefs[lastDeviceHostKey] != null ||
+                prefs[lastDevicePortKey] != null
+            ) {
+                appContext.settingsDataStore.edit { mutable ->
+                    mutable.remove(lastDeviceNameKey)
+                    mutable.remove(lastDeviceHostKey)
+                    mutable.remove(lastDevicePortKey)
+                }
+            }
+            return null
+        }
+        val encoded = KeystoreCrypto.decrypt(wrapped) ?: return null
+        return HomeNetworkBindingCodec.decode(encoded)
     }
 
-    suspend fun setLastDevice(device: DiscoveredAtv) {
+    suspend fun setHomeNetworkBinding(binding: HomeNetworkBinding) {
+        val wrapped = KeystoreCrypto.encrypt(HomeNetworkBindingCodec.encode(binding))
         appContext.settingsDataStore.edit { prefs ->
-            prefs[lastDeviceNameKey] = device.name
-            prefs[lastDeviceHostKey] = device.host
-            prefs[lastDevicePortKey] = device.port
+            prefs[homeNetworkBindingKey] = wrapped
+            // Delete the legacy plaintext endpoint as soon as a secure binding
+            // is established.
+            prefs.remove(lastDeviceNameKey)
+            prefs.remove(lastDeviceHostKey)
+            prefs.remove(lastDevicePortKey)
         }
     }
 
-    suspend fun clearLastDeviceIf(name: String) {
+    suspend fun clearHomeNetworkBindingIf(name: String) {
         appContext.settingsDataStore.edit { prefs ->
+            val bindingName = prefs[homeNetworkBindingKey]
+                ?.let(KeystoreCrypto::decrypt)
+                ?.let(HomeNetworkBindingCodec::decode)
+                ?.deviceName
+            if (bindingName == name) prefs.remove(homeNetworkBindingKey)
             if (prefs[lastDeviceNameKey] == name) {
                 prefs.remove(lastDeviceNameKey)
                 prefs.remove(lastDeviceHostKey)

@@ -1,0 +1,8 @@
+syntax = "proto2";
+option java_package = "dev.companionremote.protocol.mrp.proto";
+option java_multiple_files = true;
+
+
+message PlaybackQueueContext {
+  optional string revision = 1;
+}

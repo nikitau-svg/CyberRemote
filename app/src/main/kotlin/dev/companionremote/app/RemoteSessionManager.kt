@@ -6,16 +6,24 @@ import android.content.Context
 import android.os.SystemClock
 import android.service.quicksettings.TileService
 import dev.companionremote.app.data.CredentialsRepository
+import dev.companionremote.app.data.HomeNetworkRepository
 import dev.companionremote.app.data.SettingsRepository
 import dev.companionremote.app.discovery.AtvDiscovery
 import dev.companionremote.app.discovery.DiscoveredAtv
 import dev.companionremote.app.diagnostics.Diagnostics
 import dev.companionremote.app.diagnostics.Diagnostics.DiagnosticToken
+import dev.companionremote.app.nowplaying.NowPlayingSnapshot
+import dev.companionremote.app.nowplaying.NowPlayingSource
+import dev.companionremote.app.nowplaying.ArtworkPayload
+import dev.companionremote.app.nowplaying.PlaybackStatus
+import dev.companionremote.app.nowplaying.PositionAnchor
+import dev.companionremote.app.nowplaying.SnapshotFreshness
 import dev.companionremote.app.quick.LockScreenRemotePolicy
 import dev.companionremote.app.quick.LockedRemoteRateLimiter
 import dev.companionremote.app.quick.QuickRemoteAction
 import dev.companionremote.app.quick.RemoteTileService
 import dev.companionremote.protocol.client.CompanionClient
+import dev.companionremote.protocol.client.CompanionPlaybackState
 import dev.companionremote.protocol.client.KeyboardFocusState
 import dev.companionremote.protocol.client.TouchPhase
 import dev.companionremote.protocol.companion.CompanionConnection
@@ -56,6 +64,7 @@ class RemoteSessionManager private constructor(context: Context) {
     private val appContext = context.applicationContext
     private val credentialsRepository = CredentialsRepository(appContext)
     private val settingsRepository = SettingsRepository(appContext)
+    private val homeNetworkRepository = HomeNetworkRepository(appContext)
     private val discovery = AtvDiscovery(appContext)
     private val keyguard = appContext.getSystemService(KeyguardManager::class.java)
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
@@ -65,6 +74,7 @@ class RemoteSessionManager private constructor(context: Context) {
     private var client: CompanionClient? = null
     private var credentials: HapCredentials? = null
     private var keyboardJob: Job? = null
+    private var nowPlayingJob: Job? = null
     private var uiOwner = false
     private var panelOwner = false
     private var quickRemoteOwner = false
@@ -83,6 +93,9 @@ class RemoteSessionManager private constructor(context: Context) {
 
     private val _keyboardFocus = MutableStateFlow(KeyboardFocusState.Unknown)
     val keyboardFocus: StateFlow<KeyboardFocusState> = _keyboardFocus
+
+    private val _nowPlaying = MutableStateFlow(NowPlayingSnapshot.Disconnected)
+    val nowPlaying: StateFlow<NowPlayingSnapshot> = _nowPlaying
 
     private data class CommandRequest(
         val block: suspend (CompanionClient) -> Unit,
@@ -164,8 +177,26 @@ class RemoteSessionManager private constructor(context: Context) {
 
     suspend fun connect(device: DiscoveredAtv, credentials: HapCredentials): Boolean =
         sessionMutex.withLock {
-            connectLocked(device, credentials) { !keyguard.isKeyguardLocked }
+            val authorization = homeNetworkRepository.automaticAuthorization(credentials.atvId)
+                ?: return@withLock failLocked(HOME_NETWORK_REQUIRED)
+            connectLocked(device, credentials) {
+                !keyguard.isKeyguardLocked && authorization.isStillValid()
+            }
         }
+
+    /**
+     * Explicit device-list selection may establish/move the home binding, but
+     * only after pair-verify cryptographically authenticates the stored HAP ID.
+     * Automatic entry points never call this method.
+     */
+    suspend fun connectUserSelected(
+        device: DiscoveredAtv,
+        credentials: HapCredentials,
+    ): Boolean = sessionMutex.withLock {
+        val connected = connectLocked(device, credentials) { !keyguard.isKeyguardLocked }
+        if (connected) homeNetworkRepository.bind(device, credentials.atvId)
+        connected
+    }
 
     suspend fun connectLastPaired(
         requireUnlocked: Boolean = true,
@@ -187,8 +218,12 @@ class RemoteSessionManager private constructor(context: Context) {
 
     suspend fun reconnect(): Boolean = sessionMutex.withLock {
         if (keyguard.isKeyguardLocked) return@withLock false
-        val device = _activeDevice.value ?: settingsRepository.lastDevice()
-        if (device == null) {
+        val active = _activeDevice.value
+        val storedName = active?.name
+        val creds = credentials ?: storedName?.let { credentialsRepository.load(it) }?.let { stored ->
+            runCatching { HapCredentials.parse(stored) }.getOrNull()
+        }
+        if (active == null || creds == null) {
             val connected = connectLastPairedLocked { !keyguard.isKeyguardLocked }
             if (keyguard.isKeyguardLocked) {
                 closeLocked()
@@ -196,10 +231,11 @@ class RemoteSessionManager private constructor(context: Context) {
             }
             return@withLock connected
         }
-        val creds = credentials ?: credentialsRepository.load(device.name)?.let { stored ->
-            runCatching { HapCredentials.parse(stored) }.getOrNull()
-        } ?: return@withLock failLocked("Pairing credentials are invalid")
-        val connected = connectLocked(device, creds) { !keyguard.isKeyguardLocked }
+        val authorization = homeNetworkRepository.automaticAuthorization(creds.atvId)
+            ?: return@withLock failLocked(HOME_NETWORK_REQUIRED)
+        val connected = connectLocked(active, creds) {
+            !keyguard.isKeyguardLocked && authorization.isStillValid()
+        }
         if (keyguard.isKeyguardLocked) {
             closeLocked()
             false
@@ -349,29 +385,20 @@ class RemoteSessionManager private constructor(context: Context) {
         stillAllowed: () -> Boolean = { true },
     ): Boolean {
         if (!stillAllowed()) return false
-        var device = settingsRepository.lastDevice()
-        if (!stillAllowed()) return false
-        var stored = device?.let { credentialsRepository.load(it.name) }
-        if (!stillAllowed()) return false
-
-        if (device == null || stored == null) {
-            val name = credentialsRepository.pairedDeviceNames().sorted().firstOrNull()
-                ?: return failLocked("Pair an Apple TV in the app first")
-            if (!stillAllowed()) return false
-            stored = credentialsRepository.load(name)
-                ?: return failLocked("Pairing credentials are unavailable")
-            if (!stillAllowed()) return false
-            device = discovery.resolveByName(name)
-                ?: return failLocked("Apple TV is not reachable on this Wi-Fi network")
-            if (!stillAllowed()) return false
-        }
-
-        val selectedDevice = device ?: return failLocked("No paired Apple TV is available")
-        val storedCredentials = stored ?: return failLocked("Pairing credentials are unavailable")
+        val networkAuthorization = homeNetworkRepository.automaticAuthorization()
+            ?: return failLocked(HOME_NETWORK_REQUIRED)
+        if (!stillAllowed() || !networkAuthorization.isStillValid()) return false
+        val selectedDevice = homeNetworkRepository.device(networkAuthorization.binding)
+        val storedCredentials = credentialsRepository.load(selectedDevice.name)
+            ?: return failLocked("Pairing credentials are unavailable")
         val parsed = runCatching { HapCredentials.parse(storedCredentials) }.getOrElse {
             return failLocked("Pairing credentials are invalid")
         }
-        return connectLocked(selectedDevice, parsed, stillAllowed)
+        val deviceAuthorization = homeNetworkRepository.automaticAuthorization(parsed.atvId)
+            ?: return failLocked(HOME_NETWORK_REQUIRED)
+        return connectLocked(selectedDevice, parsed) {
+            stillAllowed() && deviceAuthorization.isStillValid()
+        }
     }
 
     private suspend fun connectLocked(
@@ -405,7 +432,10 @@ class RemoteSessionManager private constructor(context: Context) {
                     closeLocked()
                     return false
                 }
-                target = discovery.resolveByName(initialDevice.name) ?: initialDevice
+                target = discovery.resolveByName(
+                    name = initialDevice.name,
+                    authorizationStillValid = stillAllowed,
+                ) ?: initialDevice
                 if (!stillAllowed()) {
                     closeLocked()
                     return false
@@ -430,7 +460,12 @@ class RemoteSessionManager private constructor(context: Context) {
                     closeLocked()
                     return false
                 }
-                settingsRepository.setLastDevice(target)
+                // Endpoint updates are accepted only for the same keyed HAP
+                // identity on the currently bound LAN. Failure to persist a
+                // cache refresh must not invalidate an authenticated session.
+                runCatching {
+                    homeNetworkRepository.updateEndpointIfAuthorized(target, newCredentials.atvId)
+                }
                 if (!stillAllowed()) {
                     runCatching { newClient.close() }
                     closeLocked()
@@ -442,6 +477,7 @@ class RemoteSessionManager private constructor(context: Context) {
                 _connectionState.value = ConnectionState.Connected
                 _connectionError.value = null
                 observeKeyboard(newClient)
+                observeNowPlaying(newClient)
                 return true
             } catch (_: ConnectionAuthorizationRevoked) {
                 runCatching { candidate?.close() }
@@ -485,10 +521,65 @@ class RemoteSessionManager private constructor(context: Context) {
         }
     }
 
+    private fun observeNowPlaying(newClient: CompanionClient) {
+        nowPlayingJob?.cancel()
+        nowPlayingJob = scope.launch {
+            newClient.nowPlaying.collect { update ->
+                if (update == null) return@collect
+                val observedAtElapsedMs = update.capturedAtNanos / 1_000_000L
+                _nowPlaying.value = NowPlayingSnapshot(
+                    status = when (update.playbackState) {
+                        CompanionPlaybackState.Playing -> PlaybackStatus.Playing
+                        CompanionPlaybackState.Paused -> PlaybackStatus.Paused
+                        CompanionPlaybackState.Unknown -> PlaybackStatus.Unknown
+                    },
+                    freshness = SnapshotFreshness.Live,
+                    source = NowPlayingSource.Companion,
+                    title = update.title,
+                    artist = update.artist,
+                    album = update.album,
+                    seriesName = update.seriesName,
+                    episodeNumber = update.episodeNumber,
+                    durationMs = update.durationMs,
+                    position = update.positionMs?.let { positionMs ->
+                        PositionAnchor(
+                            positionMs = positionMs,
+                            capturedAtElapsedMs = observedAtElapsedMs,
+                            playbackRate = update.playbackRate ?: 0.0,
+                        )
+                    },
+                    contentId = update.contentId,
+                    artworkId = update.artworkId,
+                    artwork = update.artworkId?.let { artworkId ->
+                        ArtworkPayload(
+                            id = artworkId,
+                            urlTemplate = update.artworkUrlTemplate,
+                            data = update.artworkData,
+                        )
+                    },
+                    observedAtElapsedMs = observedAtElapsedMs,
+                )
+                Diagnostics.record(
+                    appContext,
+                    "now_playing",
+                    "companion_update",
+                    "state" to update.playbackState,
+                    "has_title" to (update.title != null),
+                    "has_duration" to (update.durationMs != null),
+                    "has_position" to (update.positionMs != null),
+                    "has_artwork" to (update.artworkData != null || update.artworkUrlTemplate != null),
+                )
+            }
+        }
+    }
+
     private suspend fun closeLocked(graceful: Boolean = false) {
         keyboardJob?.cancel()
         keyboardJob = null
+        nowPlayingJob?.cancel()
+        nowPlayingJob = null
         _keyboardFocus.value = KeyboardFocusState.Unknown
+        _nowPlaying.value = NowPlayingSnapshot.Disconnected
         val current = client
         client = null
         credentials = null
@@ -512,6 +603,12 @@ class RemoteSessionManager private constructor(context: Context) {
         runCatching { client?.close() }
         client = null
         credentials = null
+        keyboardJob?.cancel()
+        keyboardJob = null
+        nowPlayingJob?.cancel()
+        nowPlayingJob = null
+        _keyboardFocus.value = KeyboardFocusState.Unknown
+        _nowPlaying.value = NowPlayingSnapshot.Disconnected
         _connectionState.value = ConnectionState.Disconnected
         _connectionError.value = message
         return false
@@ -532,6 +629,8 @@ class RemoteSessionManager private constructor(context: Context) {
         private const val DISCONNECT_TIMEOUT_MS = 2_000L
         private const val COMMAND_QUEUE_CAPACITY = 256
         private const val CONNECTION_AUTH_POLL_MS = 50L
+        private const val HOME_NETWORK_REQUIRED =
+            "Connect to the Wi-Fi network where this Apple TV was paired"
 
         @Volatile
         private var instance: RemoteSessionManager? = null

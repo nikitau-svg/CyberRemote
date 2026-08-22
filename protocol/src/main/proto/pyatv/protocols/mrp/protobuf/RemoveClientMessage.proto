@@ -1,0 +1,15 @@
+syntax = "proto2";
+option java_package = "dev.companionremote.protocol.mrp.proto";
+option java_multiple_files = true;
+
+
+import "pyatv/protocols/mrp/protobuf/ProtocolMessage.proto";
+import "pyatv/protocols/mrp/protobuf/NowPlayingClient.proto";
+
+extend ProtocolMessage {
+  optional RemoveClientMessage removeClientMessage = 57;
+}
+
+message RemoveClientMessage {
+  optional NowPlayingClient client = 1;
+}
