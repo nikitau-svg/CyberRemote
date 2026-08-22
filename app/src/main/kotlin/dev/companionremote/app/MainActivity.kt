@@ -1,9 +1,12 @@
 package dev.companionremote.app
 
-import android.os.Bundle
+import android.content.pm.PackageManager
 import android.content.Intent
+import android.os.Build
+import android.os.Bundle
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.activity.viewModels
 import androidx.compose.foundation.background
 import androidx.compose.foundation.isSystemInDarkTheme
@@ -20,6 +23,10 @@ import androidx.compose.ui.graphics.Color
 import dev.companionremote.app.data.AppSkin
 import dev.companionremote.app.data.ThemeMode
 import dev.companionremote.app.diagnostics.Diagnostics
+import dev.companionremote.app.diagnostics.Diagnostics.DiagnosticToken
+import dev.companionremote.app.discovery.ACCESS_LOCAL_NETWORK_PERMISSION
+import dev.companionremote.app.discovery.LocalNetworkPermissionGate
+import dev.companionremote.app.discovery.LocalNetworkScanAction
 import dev.companionremote.app.i18n.LocalAppStrings
 import dev.companionremote.app.i18n.currentSystemLanguage
 import dev.companionremote.app.i18n.resolveStrings
@@ -35,6 +42,18 @@ import dev.companionremote.app.ui.SettingsScreen
 class MainActivity : ComponentActivity() {
 
     private val viewModel: AppViewModel by viewModels()
+    private val localNetworkPermissionGate = LocalNetworkPermissionGate()
+    private val localNetworkPermission = registerForActivityResult(
+        ActivityResultContracts.RequestPermission(),
+    ) { granted ->
+        Diagnostics.record(
+            this,
+            "local_network_permission",
+            "result",
+            "granted" to granted,
+        )
+        handleLocalNetworkScanAction(localNetworkPermissionGate.permissionResult(granted))
+    }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -49,7 +68,10 @@ class MainActivity : ComponentActivity() {
                 CompositionLocalProvider(LocalAppStrings provides strings) {
                     Surface(color = Color.Transparent) {
                         when (val current = screen) {
-                            is Screen.DeviceList -> DeviceListScreen(viewModel)
+                            is Screen.DeviceList -> DeviceListScreen(
+                                viewModel = viewModel,
+                                onRescan = { scanWithLocalNetworkPermission(userInitiated = true) },
+                            )
                             is Screen.Settings -> SettingsScreen(viewModel)
                             is Screen.Pairing -> PairingScreen(viewModel, current.device)
                             is Screen.Remote -> RemoteScreen(viewModel, current.device)
@@ -59,6 +81,7 @@ class MainActivity : ComponentActivity() {
             }
         }
         handleIntent(intent)
+        scanWithLocalNetworkPermission(userInitiated = false)
     }
 
     override fun onNewIntent(intent: Intent) {
@@ -72,6 +95,39 @@ class MainActivity : ComponentActivity() {
         if (RemoteSessionManager.get(this).consumeOpenFullRemoteToken(token)) {
             intent?.removeExtra(EXTRA_OPEN_LAST_REMOTE_TOKEN)
             viewModel.openLastRemote()
+        }
+    }
+
+    private fun scanWithLocalNetworkPermission(userInitiated: Boolean) {
+        val permissionGranted = Build.VERSION.SDK_INT < 37 ||
+            checkSelfPermission(ACCESS_LOCAL_NETWORK_PERMISSION) == PackageManager.PERMISSION_GRANTED
+        handleLocalNetworkScanAction(
+            localNetworkPermissionGate.requestScan(
+                userInitiated = userInitiated,
+                sdkInt = Build.VERSION.SDK_INT,
+                permissionGranted = permissionGranted,
+            ),
+        )
+    }
+
+    private fun handleLocalNetworkScanAction(action: LocalNetworkScanAction) {
+        when (action) {
+            is LocalNetworkScanAction.RunScan -> viewModel.startScan(action.userInitiated)
+            LocalNetworkScanAction.RequestPermission -> {
+                Diagnostics.record(
+                    this,
+                    "local_network_permission",
+                    "requested",
+                    "sdk" to Build.VERSION.SDK_INT,
+                )
+                localNetworkPermission.launch(ACCESS_LOCAL_NETWORK_PERMISSION)
+            }
+            LocalNetworkScanAction.None -> Diagnostics.record(
+                this,
+                "discovery",
+                "scan_skipped",
+                "reason" to DiagnosticToken("permission"),
+            )
         }
     }
 

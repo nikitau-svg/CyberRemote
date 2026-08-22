@@ -170,7 +170,6 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
                 }
             }
         }
-        startScan(userInitiated = false)
     }
 
     // Settings

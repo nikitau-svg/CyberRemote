@@ -1,12 +1,10 @@
 package dev.companionremote.app.discovery
 
 import android.content.Context
-import android.content.pm.PackageManager
 import android.net.ConnectivityManager
 import android.net.LinkProperties
 import android.net.Network
 import android.net.NetworkCapabilities
-import android.os.Build
 import dev.companionremote.app.data.KeystoreHmac
 import java.net.Inet4Address
 import java.net.Inet6Address
@@ -108,22 +106,6 @@ internal class LocalNetworkIdentity(context: Context) {
             PrivateIdentityFingerprint.device(deviceIdentifier, KeystoreHmac::sign)
         }.getOrNull()
 
-    /**
-     * Android 17 / targetSdk 37 gates LAN access behind this runtime
-     * permission. targetSdk 35 remains on the compatibility path today; once
-     * the target is raised, the UI must request the already-declared manifest
-     * permission before discovery or connection.
-     */
-    private fun hasLocalNetworkPermission(): Boolean {
-        if (Build.VERSION.SDK_INT < LOCAL_NETWORK_PERMISSION_SDK ||
-            appContext.applicationInfo.targetSdkVersion < LOCAL_NETWORK_PERMISSION_SDK
-        ) {
-            return true
-        }
-        return appContext.checkSelfPermission(LOCAL_NETWORK_PERMISSION) ==
-            PackageManager.PERMISSION_GRANTED
-    }
-
     private fun currentPhysicalNetwork(): Network? {
         val active = connectivityManager.activeNetwork
         val candidates = buildList {
@@ -174,10 +156,6 @@ internal class LocalNetworkIdentity(context: Context) {
             !isLinkLocalAddress
 
     companion object {
-        // Kept as literals while compileSdk/targetSdk remain 35.
-        private const val LOCAL_NETWORK_PERMISSION_SDK = 37
-        private const val LOCAL_NETWORK_PERMISSION = "android.permission.ACCESS_LOCAL_NETWORK"
-
         internal fun maskPrefix(address: ByteArray, prefixLength: Int): ByteArray {
             require(prefixLength in 0..address.size * 8) { "invalid prefix length" }
             val result = address.copyOf()

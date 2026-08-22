@@ -51,7 +51,10 @@ import dev.companionremote.app.i18n.LocalAppStrings
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
-fun DeviceListScreen(viewModel: AppViewModel) {
+fun DeviceListScreen(
+    viewModel: AppViewModel,
+    onRescan: () -> Unit,
+) {
     val s = LocalAppStrings.current
     val ui by viewModel.deviceList.collectAsState()
     var showManualDialog by remember { mutableStateOf(false) }
@@ -77,7 +80,7 @@ fun DeviceListScreen(viewModel: AppViewModel) {
                     if (ui.scanning) {
                         CircularProgressIndicator(Modifier.size(22.dp).padding(end = 10.dp), strokeWidth = 2.dp)
                     } else {
-                        IconButton(onClick = { viewModel.startScan() }) {
+                        IconButton(onClick = onRescan) {
                             Icon(Icons.Rounded.Refresh, contentDescription = s.rescan)
                         }
                     }

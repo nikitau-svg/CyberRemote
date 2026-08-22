@@ -8,6 +8,8 @@ import android.content.Context
 import android.content.pm.PackageManager
 import android.os.Build
 import android.os.PowerManager
+import dev.companionremote.app.discovery.ACCESS_LOCAL_NETWORK_PERMISSION
+import dev.companionremote.app.discovery.LOCAL_NETWORK_PERMISSION_SDK
 import java.io.File
 import java.io.FileOutputStream
 import java.nio.charset.StandardCharsets
@@ -164,6 +166,7 @@ object Diagnostics {
             appendLine("App: ${appVersion(appContext)}")
             appendLine("Device: ${token(Build.MANUFACTURER)} ${token(Build.MODEL)}")
             appendLine("Android: ${token(Build.VERSION.RELEASE)} (SDK ${Build.VERSION.SDK_INT})")
+            appendLine("Local network permission: ${localNetworkPermission(appContext)}")
             appendLine("Notification permission: ${notificationPermission(appContext)}")
             appendLine("App notifications: ${appNotificationState(appContext)}")
             appendLine("Media channel: ${mediaChannelState(appContext)}")
@@ -312,6 +315,18 @@ object Diagnostics {
         if (Build.VERSION.SDK_INT < Build.VERSION_CODES.TIRAMISU) {
             "not_required"
         } else if (context.checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) == PackageManager.PERMISSION_GRANTED) {
+            "granted"
+        } else {
+            "denied"
+        }
+
+    private fun localNetworkPermission(context: Context): String =
+        if (Build.VERSION.SDK_INT < LOCAL_NETWORK_PERMISSION_SDK) {
+            "not_required"
+        } else if (
+            context.checkSelfPermission(ACCESS_LOCAL_NETWORK_PERMISSION) ==
+            PackageManager.PERMISSION_GRANTED
+        ) {
             "granted"
         } else {
             "denied"

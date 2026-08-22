@@ -86,6 +86,15 @@ class AtvDiscovery(context: Context) {
             )
             return
         }
+        if (!appContext.hasLocalNetworkPermission()) {
+            Diagnostics.record(
+                appContext,
+                "discovery",
+                "scan_skipped",
+                "reason" to DiagnosticToken("permission"),
+            )
+            return
+        }
         // Check before acquiring MulticastLock so an unauthorized automatic
         // browse has no radio or battery side effect.
         if (!authorizationStillValid()) {
