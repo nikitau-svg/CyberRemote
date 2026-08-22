@@ -83,14 +83,14 @@ internal class LocalNetworkIdentity(context: Context) {
         appContext.getSystemService(ConnectivityManager::class.java)
 
     fun current(): LocalNetworkSnapshot? {
-        if (!hasLocalNetworkPermission()) return null
+        if (!appContext.hasLocalNetworkPermission()) return null
         val network = currentPhysicalNetwork() ?: return null
         return snapshot(network)
     }
 
     /** Recomputes every fingerprint input for this exact Android Network. */
     fun snapshot(network: Network): LocalNetworkSnapshot? {
-        if (!hasLocalNetworkPermission()) return null
+        if (!appContext.hasLocalNetworkPermission()) return null
         val capabilities = connectivityManager.getNetworkCapabilities(network) ?: return null
         if (!capabilities.isPhysicalLan()) return null
         val links = connectivityManager.getLinkProperties(network) ?: return null
