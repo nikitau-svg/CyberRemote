@@ -75,6 +75,7 @@ class RemoteSessionManager private constructor(context: Context) {
     private var credentials: HapCredentials? = null
     private var keyboardJob: Job? = null
     private var nowPlayingJob: Job? = null
+    private var connectionTerminationJob: Job? = null
     private var uiOwner = false
     private var panelOwner = false
     private var quickRemoteOwner = false
@@ -179,7 +180,7 @@ class RemoteSessionManager private constructor(context: Context) {
         sessionMutex.withLock {
             val authorization = homeNetworkRepository.automaticAuthorization(credentials.atvId)
                 ?: return@withLock failLocked(HOME_NETWORK_REQUIRED)
-            connectLocked(device, credentials) {
+            connectLocked(device, credentials, authorization) {
                 !keyguard.isKeyguardLocked && authorization.isStillValid()
             }
         }
@@ -233,7 +234,7 @@ class RemoteSessionManager private constructor(context: Context) {
         }
         val authorization = homeNetworkRepository.automaticAuthorization(creds.atvId)
             ?: return@withLock failLocked(HOME_NETWORK_REQUIRED)
-        val connected = connectLocked(active, creds) {
+        val connected = connectLocked(active, creds, authorization) {
             !keyguard.isKeyguardLocked && authorization.isStillValid()
         }
         if (keyguard.isKeyguardLocked) {
@@ -396,7 +397,7 @@ class RemoteSessionManager private constructor(context: Context) {
         }
         val deviceAuthorization = homeNetworkRepository.automaticAuthorization(parsed.atvId)
             ?: return failLocked(HOME_NETWORK_REQUIRED)
-        return connectLocked(selectedDevice, parsed) {
+        return connectLocked(selectedDevice, parsed, deviceAuthorization) {
             stillAllowed() && deviceAuthorization.isStillValid()
         }
     }
@@ -404,6 +405,7 @@ class RemoteSessionManager private constructor(context: Context) {
     private suspend fun connectLocked(
         initialDevice: DiscoveredAtv,
         newCredentials: HapCredentials,
+        authorization: dev.companionremote.app.data.HomeNetworkAuthorization? = null,
         stillAllowed: () -> Boolean = { true },
     ): Boolean {
         if (!stillAllowed()) return false
@@ -434,6 +436,7 @@ class RemoteSessionManager private constructor(context: Context) {
                 }
                 target = discovery.resolveByName(
                     name = initialDevice.name,
+                    network = authorization?.network,
                     authorizationStillValid = stillAllowed,
                 ) ?: initialDevice
                 if (!stillAllowed()) {
@@ -444,8 +447,15 @@ class RemoteSessionManager private constructor(context: Context) {
 
             var candidate: CompanionClient? = null
             try {
-                val transport = SocketTransport.connect(target.host, target.port, CONNECT_TIMEOUT_MS)
-                val newClient = CompanionClient(CompanionConnection(transport), newCredentials)
+                val transport = SocketTransport.connect(
+                    host = target.host,
+                    port = target.port,
+                    timeoutMs = CONNECT_TIMEOUT_MS,
+                    socketFactory = authorization?.network?.socketFactory
+                        ?: javax.net.SocketFactory.getDefault(),
+                )
+                val newConnection = CompanionConnection(transport)
+                val newClient = CompanionClient(newConnection, newCredentials)
                 candidate = newClient
                 if (!stillAllowed()) {
                     runCatching { newClient.close() }
@@ -478,6 +488,7 @@ class RemoteSessionManager private constructor(context: Context) {
                 _connectionError.value = null
                 observeKeyboard(newClient)
                 observeNowPlaying(newClient)
+                observeTermination(newClient, newConnection)
                 return true
             } catch (_: ConnectionAuthorizationRevoked) {
                 runCatching { candidate?.close() }
@@ -573,7 +584,35 @@ class RemoteSessionManager private constructor(context: Context) {
         }
     }
 
+    /** Clear stale native playback state as soon as the Companion socket dies. */
+    private fun observeTermination(
+        newClient: CompanionClient,
+        connection: CompanionConnection,
+    ) {
+        connectionTerminationJob?.cancel()
+        connectionTerminationJob = scope.launch {
+            connection.termination.await()
+            sessionMutex.withLock {
+                if (client !== newClient) return@withLock
+                client = null
+                credentials = null
+                keyboardJob?.cancel()
+                keyboardJob = null
+                nowPlayingJob?.cancel()
+                nowPlayingJob = null
+                connectionTerminationJob = null
+                _keyboardFocus.value = KeyboardFocusState.Unknown
+                _nowPlaying.value = NowPlayingSnapshot.Disconnected
+                _connectionState.value = ConnectionState.Disconnected
+                _connectionError.value = "Apple TV connection closed"
+                Diagnostics.record(appContext, "remote_session", "connection_terminated")
+            }
+        }
+    }
+
     private suspend fun closeLocked(graceful: Boolean = false) {
+        connectionTerminationJob?.cancel()
+        connectionTerminationJob = null
         keyboardJob?.cancel()
         keyboardJob = null
         nowPlayingJob?.cancel()
@@ -603,6 +642,8 @@ class RemoteSessionManager private constructor(context: Context) {
         runCatching { client?.close() }
         client = null
         credentials = null
+        connectionTerminationJob?.cancel()
+        connectionTerminationJob = null
         keyboardJob?.cancel()
         keyboardJob = null
         nowPlayingJob?.cancel()

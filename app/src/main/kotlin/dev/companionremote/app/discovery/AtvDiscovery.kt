@@ -1,9 +1,11 @@
 package dev.companionremote.app.discovery
 
 import android.content.Context
+import android.net.Network
 import android.net.nsd.NsdManager
 import android.net.nsd.NsdServiceInfo
 import android.net.wifi.WifiManager
+import android.os.Build
 import kotlin.coroutines.resume
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.async
@@ -18,6 +20,22 @@ data class DiscoveredAtv(
     val port: Int,
     val model: String?,
 )
+
+internal enum class NsdDiscoveryMode {
+    Legacy,
+    NetworkScoped,
+    UnsupportedScoped,
+}
+
+/**
+ * A scoped automatic browse must never silently fall back to all networks.
+ * Android only exposes the Network-specific NSD overload from API 33.
+ */
+internal fun nsdDiscoveryMode(networkRequested: Boolean, sdkInt: Int): NsdDiscoveryMode = when {
+    !networkRequested -> NsdDiscoveryMode.Legacy
+    sdkInt >= Build.VERSION_CODES.TIRAMISU -> NsdDiscoveryMode.NetworkScoped
+    else -> NsdDiscoveryMode.UnsupportedScoped
+}
 
 /**
  * mDNS discovery of `_companion-link._tcp` services via NsdManager.
@@ -37,10 +55,20 @@ class AtvDiscovery(context: Context) {
      */
     suspend fun scan(
         durationMs: Long = 6_000,
+        network: Network? = null,
         authorizationStillValid: () -> Boolean = { true },
         serviceNameFilter: (String) -> Boolean = { true },
         onDevice: (DiscoveredAtv) -> Unit,
     ) {
+        val discoveryMode = nsdDiscoveryMode(
+            networkRequested = network != null,
+            sdkInt = Build.VERSION.SDK_INT,
+        )
+        // On Android 12L and below, NSD cannot be constrained to a specific
+        // Network. Automatic discovery therefore fails closed instead of
+        // leaking a browse onto another attached LAN. A null network is an
+        // explicit/user-initiated browse and may use the legacy API.
+        if (discoveryMode == NsdDiscoveryMode.UnsupportedScoped) return
         // Check before acquiring MulticastLock so an unauthorized automatic
         // browse has no radio or battery side effect.
         if (!authorizationStillValid()) return
@@ -66,7 +94,26 @@ class AtvDiscovery(context: Context) {
         }
 
         try {
-            nsdManager.discoverServices(SERVICE_TYPE, NsdManager.PROTOCOL_DNS_SD, listener)
+            when (discoveryMode) {
+                NsdDiscoveryMode.Legacy -> nsdManager.discoverServices(
+                    SERVICE_TYPE,
+                    NsdManager.PROTOCOL_DNS_SD,
+                    listener,
+                )
+
+                NsdDiscoveryMode.NetworkScoped -> {
+                    if (Build.VERSION.SDK_INT < Build.VERSION_CODES.TIRAMISU) return
+                    nsdManager.discoverServices(
+                        SERVICE_TYPE,
+                        NsdManager.PROTOCOL_DNS_SD,
+                        checkNotNull(network),
+                        appContext.mainExecutor,
+                        listener,
+                    )
+                }
+
+                NsdDiscoveryMode.UnsupportedScoped -> return
+            }
             val deadline = System.currentTimeMillis() + durationMs
             val resolved = mutableSetOf<String>()
             while (System.currentTimeMillis() < deadline && authorizationStillValid()) {
@@ -95,6 +142,7 @@ class AtvDiscovery(context: Context) {
     suspend fun resolveByName(
         name: String,
         timeoutMs: Long = 6_000,
+        network: Network? = null,
         authorizationStillValid: () -> Boolean = { true },
     ): DiscoveredAtv? =
         withTimeoutOrNull(timeoutMs) {
@@ -104,6 +152,7 @@ class AtvDiscovery(context: Context) {
                 val scanJob = async {
                     scan(
                         durationMs = timeoutMs,
+                        network = network,
                         authorizationStillValid = authorizationStillValid,
                         serviceNameFilter = { it == name },
                     ) { device ->

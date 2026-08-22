@@ -14,6 +14,11 @@ import android.graphics.BitmapFactory
 import android.media.MediaMetadata
 import android.media.session.MediaSession
 import android.media.session.PlaybackState
+import android.net.ConnectivityManager
+import android.net.LinkProperties
+import android.net.Network
+import android.net.NetworkCapabilities
+import android.net.NetworkRequest
 import android.net.Uri
 import android.os.Build
 import android.os.Bundle
@@ -25,6 +30,8 @@ import dev.companionremote.app.ConnectionState
 import dev.companionremote.app.R
 import dev.companionremote.app.RemoteSessionManager
 import dev.companionremote.app.data.SettingsRepository
+import dev.companionremote.app.data.HomeNetworkAuthorization
+import dev.companionremote.app.data.HomeNetworkRepository
 import dev.companionremote.app.diagnostics.Diagnostics
 import dev.companionremote.app.diagnostics.Diagnostics.DiagnosticToken
 import dev.companionremote.app.diagnostics.Diagnostics.RuntimePlayback
@@ -43,6 +50,7 @@ import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.channels.Channel
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.combine
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
@@ -55,8 +63,12 @@ class RemoteControlService : Service() {
     private val ingressRateLimiter = LockedRemoteRateLimiter { SystemClock.elapsedRealtime() }
     private var connectJob: Job? = null
     private var artworkJob: Job? = null
+    private var networkRevalidationJob: Job? = null
+    private var reconnectRetryJob: Job? = null
     private lateinit var session: RemoteSessionManager
     private lateinit var settings: SettingsRepository
+    private lateinit var homeNetworks: HomeNetworkRepository
+    private lateinit var connectivityManager: ConnectivityManager
     private lateinit var keyguard: KeyguardManager
     private var mediaSession: MediaSession? = null
     private var foregroundStarted = false
@@ -64,6 +76,12 @@ class RemoteControlService : Service() {
     private var lockScreenControlsEnabled = false
     private var loadedArtworkId: String? = null
     private var artworkBitmap: Bitmap? = null
+    private var networkCallback: ConnectivityManager.NetworkCallback? = null
+    private var homeAuthorization: HomeNetworkAuthorization? = null
+    private var networkReconnectArmed = false
+    private val homeNetworkPolicy = HomeNetworkServicePolicy()
+    private val reconnectBackoff = BoundedReconnectBackoff()
+    private var lastObservedConnectionState = ConnectionState.Disconnected
     @Volatile private var capabilityToken = UUID.randomUUID().toString()
     private var lastSnapshot = NotificationSnapshot(
         state = ConnectionState.Disconnected,
@@ -77,6 +95,8 @@ class RemoteControlService : Service() {
         super.onCreate()
         session = RemoteSessionManager.get(this)
         settings = SettingsRepository(this)
+        homeNetworks = HomeNetworkRepository(this)
+        connectivityManager = getSystemService(ConnectivityManager::class.java)
         keyguard = getSystemService(KeyguardManager::class.java)
         try {
             RemoteNotification.createChannel(this)
@@ -126,6 +146,7 @@ class RemoteControlService : Service() {
                 updateArtwork(snapshot.nowPlaying.artwork)
                 updateMediaSession(snapshot)
                 refreshNotification()
+                handleConnectionLifecycle(snapshot.state)
                 TileService.requestListeningState(
                     this@RemoteControlService,
                     ComponentName(this@RemoteControlService, RemoteTileService::class.java),
@@ -180,7 +201,7 @@ class RemoteControlService : Service() {
             QuickRemoteAction.fromWireValue(intent.getStringExtra(EXTRA_COMMAND))
                 ?.let(::enqueueAction)
             ensureForeground()
-            return START_NOT_STICKY
+            return START_STICKY
         }
 
         val expectedCapability = intent?.getStringExtra(EXTRA_EXPECTED_CAPABILITY)
@@ -204,22 +225,32 @@ class RemoteControlService : Service() {
         activateControlLease()
         ensureForeground()
         when (intent?.action) {
-            ACTION_START, null -> {
+            ACTION_START -> {
                 // Opening controls while already locked must not silently create
-                // a fresh network session. Existing connected sessions may stay.
+                // a fresh network session. A lease armed while unlocked may later
+                // reconnect passively while locked when the home LAN returns.
                 if (!keyguard.isKeyguardLocked) {
-                    val leaseToken = capabilityToken
-                    connectJob?.cancel()
-                    connectJob = scope.launch {
-                        session.connectLastPaired(
-                            requireUnlocked = true,
-                            authorizationStillValid = { isControlLeaseActive(leaseToken) },
-                        )
-                    }
+                    networkReconnectArmed = true
+                    scheduleHomeNetworkRevalidation(
+                        "explicit_start",
+                        immediate = true,
+                        rearm = true,
+                    )
                 }
             }
+            null -> {
+                // START_STICKY is used only for an already-running foreground
+                // control lease. Process death invalidates every old PendingIntent;
+                // this fresh lease gets a fresh capability and notification.
+                networkReconnectArmed = true
+                scheduleHomeNetworkRevalidation(
+                    "sticky_restart",
+                    immediate = true,
+                    rearm = true,
+                )
+            }
         }
-        return START_NOT_STICKY
+        return START_STICKY
     }
 
     override fun onBind(intent: Intent?): IBinder? = null
@@ -234,6 +265,15 @@ class RemoteControlService : Service() {
         commandQueue.close()
         connectJob?.cancel()
         connectJob = null
+        networkRevalidationJob?.cancel()
+        networkRevalidationJob = null
+        reconnectRetryJob?.cancel()
+        reconnectRetryJob = null
+        reconnectBackoff.reset()
+        unregisterNetworkCallback()
+        homeAuthorization = null
+        networkReconnectArmed = false
+        homeNetworkPolicy.reset()
         artworkJob?.cancel()
         artworkJob = null
         artworkBitmap = null
@@ -394,7 +434,7 @@ class RemoteControlService : Service() {
             allowReconnect = !queued.wasLockedAtIngress,
             maxAgeMs = remainingAge,
             authorizationStillValid = {
-                acceptingCommands && queued.capabilityToken == capabilityToken
+                isServiceNetworkAuthorized(queued.capabilityToken)
             },
         )
         Diagnostics.record(
@@ -405,6 +445,205 @@ class RemoteControlService : Service() {
             "success" to succeeded,
             "locked" to queued.wasLockedAtIngress,
         )
+    }
+
+    private fun isServiceNetworkAuthorized(leaseToken: String): Boolean =
+        isControlLeaseActive(leaseToken) && homeAuthorization?.isStillValid() == true
+
+    private fun registerNetworkCallback() {
+        if (networkCallback != null) return
+        val callback = object : ConnectivityManager.NetworkCallback() {
+            override fun onAvailable(network: Network) {
+                scope.launch { scheduleHomeNetworkRevalidation("available", rearm = true) }
+            }
+
+            override fun onCapabilitiesChanged(
+                network: Network,
+                networkCapabilities: NetworkCapabilities,
+            ) {
+                scope.launch { scheduleHomeNetworkRevalidation("capabilities", rearm = true) }
+            }
+
+            override fun onLinkPropertiesChanged(network: Network, linkProperties: LinkProperties) {
+                scope.launch { scheduleHomeNetworkRevalidation("link_properties", rearm = true) }
+            }
+
+            override fun onLost(network: Network) {
+                scope.launch {
+                    if (homeAuthorization?.isFor(network) == true) {
+                        leaveHomeNetwork("lost")
+                    } else {
+                        scheduleHomeNetworkRevalidation(
+                            "lost",
+                            immediate = true,
+                            rearm = true,
+                        )
+                    }
+                }
+            }
+        }
+        val request = NetworkRequest.Builder()
+            .addCapability(NetworkCapabilities.NET_CAPABILITY_NOT_VPN)
+            .addTransportType(NetworkCapabilities.TRANSPORT_WIFI)
+            .addTransportType(NetworkCapabilities.TRANSPORT_ETHERNET)
+            .build()
+        try {
+            connectivityManager.registerNetworkCallback(request, callback)
+            networkCallback = callback
+            Diagnostics.record(this, "home_network", "callback_registered")
+        } catch (error: RuntimeException) {
+            Diagnostics.exception(this, "home_network", "callback_register", error)
+            // Fail closed if Android refuses network observation.
+            networkReconnectArmed = false
+            homeAuthorization = null
+            connectJob?.cancel()
+            connectJob = null
+            scope.launch { session.disconnect(force = true) }
+        }
+    }
+
+    private fun unregisterNetworkCallback() {
+        val callback = networkCallback ?: return
+        networkCallback = null
+        runCatching { connectivityManager.unregisterNetworkCallback(callback) }
+            .onFailure { error ->
+                Diagnostics.exception(this, "home_network", "callback_unregister", error)
+            }
+        Diagnostics.record(this, "home_network", "callback_unregistered")
+    }
+
+    /** Collapse callback bursts; onLost for the authorized Network bypasses the delay. */
+    private fun scheduleHomeNetworkRevalidation(
+        trigger: String,
+        immediate: Boolean = false,
+        rearm: Boolean = false,
+    ) {
+        if (rearm) {
+            reconnectRetryJob?.cancel()
+            reconnectRetryJob = null
+            reconnectBackoff.reset()
+            homeNetworkPolicy.reset()
+        }
+        networkRevalidationJob?.cancel()
+        networkRevalidationJob = scope.launch {
+            if (!immediate) delay(NETWORK_CALLBACK_DEBOUNCE_MS)
+            reconcileHomeNetwork(trigger)
+        }
+    }
+
+    private suspend fun reconcileHomeNetwork(trigger: String) {
+        val leaseToken = capabilityToken
+        if (!isControlLeaseActive(leaseToken)) return
+        val authorization = homeNetworks.automaticAuthorization()
+            ?.takeIf { it.isStillValid() }
+        homeAuthorization = authorization
+        val action = homeNetworkPolicy.evaluate(
+            leaseActive = isControlLeaseActive(leaseToken),
+            reconnectArmed = networkReconnectArmed,
+            authorized = authorization != null,
+            connectedOrConnecting = session.connectionState.value != ConnectionState.Disconnected,
+            connectionAttemptActive = connectJob?.isActive == true,
+        )
+        Diagnostics.record(
+            this,
+            "home_network",
+            "revalidated",
+            "trigger" to DiagnosticToken(trigger),
+            "authorized" to (authorization != null),
+            "action" to action,
+        )
+        when (action) {
+            HomeNetworkServiceAction.None -> Unit
+            HomeNetworkServiceAction.Disconnect -> {
+                // Avoid cancelling the coroutine that is performing this departure.
+                networkRevalidationJob = null
+                leaveHomeNetwork("revalidation")
+            }
+            HomeNetworkServiceAction.Reconnect -> {
+                val validAuthorization = authorization ?: return
+                connectJob?.cancel()
+                connectJob = scope.launch {
+                    session.connectLastPaired(
+                        // This is state synchronization owned by an already-active
+                        // foreground lease; input commands retain their lock policy.
+                        requireUnlocked = false,
+                        authorizationStillValid = {
+                            networkReconnectArmed &&
+                                isControlLeaseActive(leaseToken) &&
+                                validAuthorization.isStillValid()
+                        },
+                    )
+                }
+            }
+        }
+    }
+
+    private suspend fun leaveHomeNetwork(reason: String) {
+        networkRevalidationJob?.cancel()
+        networkRevalidationJob = null
+        homeAuthorization = null
+        connectJob?.cancel()
+        connectJob = null
+        reconnectRetryJob?.cancel()
+        reconnectRetryJob = null
+        reconnectBackoff.reset()
+        homeNetworkPolicy.evaluate(
+            leaseActive = isControlLeaseActive(capabilityToken),
+            reconnectArmed = networkReconnectArmed,
+            authorized = false,
+            connectedOrConnecting = session.connectionState.value != ConnectionState.Disconnected,
+            connectionAttemptActive = false,
+        )
+        Diagnostics.record(
+            this,
+            "home_network",
+            "departed",
+            "reason" to DiagnosticToken(reason),
+        )
+        session.disconnect(force = true)
+        // A handover can deliver onLost before onAvailable. Recheck once after
+        // the burst so an equivalent home Network can establish a fresh lease.
+        scheduleHomeNetworkRevalidation("post_departure")
+    }
+
+    private fun handleConnectionLifecycle(state: ConnectionState) {
+        val previous = lastObservedConnectionState
+        lastObservedConnectionState = state
+        when (state) {
+            ConnectionState.Connected -> {
+                reconnectRetryJob?.cancel()
+                reconnectRetryJob = null
+                reconnectBackoff.reset()
+            }
+            ConnectionState.Connecting -> {
+                // A real attempt is already in progress; do not let an older
+                // delayed retry race it.
+                reconnectRetryJob?.cancel()
+                reconnectRetryJob = null
+            }
+            ConnectionState.Disconnected -> {
+                if (previous != ConnectionState.Disconnected) scheduleBoundedReconnect()
+            }
+        }
+    }
+
+    private fun scheduleBoundedReconnect() {
+        if (!networkReconnectArmed || !acceptingCommands) return
+        if (homeAuthorization?.isStillValid() != true) return
+        if (reconnectRetryJob?.isActive == true) return
+        val delayMs = reconnectBackoff.nextDelayMs() ?: run {
+            Diagnostics.record(this, "home_network", "retry_budget_exhausted")
+            return
+        }
+        val leaseToken = capabilityToken
+        Diagnostics.record(this, "home_network", "retry_scheduled", "delay_ms" to delayMs)
+        reconnectRetryJob = scope.launch {
+            delay(delayMs)
+            reconnectRetryJob = null
+            if (!isServiceNetworkAuthorized(leaseToken)) return@launch
+            homeNetworkPolicy.reset()
+            scheduleHomeNetworkRevalidation("connection_retry", immediate = true)
+        }
     }
 
     private fun updateMediaSession(snapshot: NotificationSnapshot) {
@@ -636,6 +875,15 @@ class RemoteControlService : Service() {
         acceptingCommands = false
         connectJob?.cancel()
         connectJob = null
+        networkRevalidationJob?.cancel()
+        networkRevalidationJob = null
+        reconnectRetryJob?.cancel()
+        reconnectRetryJob = null
+        reconnectBackoff.reset()
+        unregisterNetworkCallback()
+        homeAuthorization = null
+        networkReconnectArmed = false
+        homeNetworkPolicy.reset()
         artworkJob?.cancel()
         artworkJob = null
         artworkBitmap = null
@@ -657,6 +905,7 @@ class RemoteControlService : Service() {
         acceptingCommands = true
         RemoteControlLeaseRegistry.activate(capabilityToken)
         session.setQuickRemoteOwner(true)
+        registerNetworkCallback()
         Diagnostics.record(this, "media_session", "creating")
         mediaSession = try {
             createMediaSession(capabilityToken)
@@ -693,6 +942,7 @@ class RemoteControlService : Service() {
         private const val ARTWORK_TIMEOUT_MS = 4_000
         private const val MAX_ARTWORK_BYTES = 3L * 1024 * 1024
         private const val DEFAULT_ARTWORK_BUFFER_BYTES = 32 * 1024
+        private const val NETWORK_CALLBACK_DEBOUNCE_MS = 350L
 
         fun start(context: Context, expectedCapability: String? = null) {
             Diagnostics.record(

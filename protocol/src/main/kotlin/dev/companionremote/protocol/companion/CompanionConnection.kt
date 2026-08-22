@@ -4,9 +4,11 @@ import dev.companionremote.protocol.opack.Opack
 import dev.companionremote.protocol.transport.Transport
 import kotlin.random.Random
 import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineName
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.CoroutineStart
+import kotlinx.coroutines.Deferred
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.cancel
@@ -62,7 +64,16 @@ class CompanionConnection(
     private var cipher: SessionCipher? = null
     private var xid: Long = Random.nextLong(0, 1 shl 16)
     private var closed = false
-    private var closeCause: Throwable? = null
+    private var closeCause: CompanionConnectionClosedException? = null
+
+    private val terminationDeferred = CompletableDeferred<CompanionConnectionClosedException>()
+
+    /**
+     * Completes exactly once when the connection terminates because of EOF,
+     * an I/O/protocol error, or an explicit [close]. The completed value is
+     * also the exception used to fail every pending exchange.
+     */
+    val termination: Deferred<CompanionConnectionClosedException> = terminationDeferred
 
     // Response waiters: key is either a Long XID or a FrameType (auth frames)
     private val waiters = mutableMapOf<Any, CompletableDeferred<Map<Any?, Any?>>>()
@@ -155,7 +166,7 @@ class CompanionConnection(
     ): Map<Any?, Any?> {
         val deferred = CompletableDeferred<Map<Any?, Any?>>()
         synchronized(lock) {
-            closeCause?.let { throw CompanionConnectionClosedException("connection closed", it) }
+            closeCause?.let { throw it }
             waiters[identifier] = deferred
         }
         try {
@@ -183,7 +194,13 @@ class CompanionConnection(
             // Encrypt under the write lock: the nonce counter must match the
             // order in which frames hit the wire.
             val body = if (encrypted) activeCipher!!.encrypt(payload, header) else payload
-            transport.write(header + body)
+            try {
+                transport.write(header + body)
+            } catch (cancelled: CancellationException) {
+                throw cancelled
+            } catch (cause: Exception) {
+                throw shutdown(cause)
+            }
         }
     }
 
@@ -235,21 +252,26 @@ class CompanionConnection(
         deferred?.complete(message)
     }
 
-    private fun shutdown(cause: Throwable) {
+    private fun shutdown(cause: Throwable): CompanionConnectionClosedException {
+        val terminal = if (cause is CompanionConnectionClosedException) {
+            cause
+        } else {
+            CompanionConnectionClosedException("connection closed", cause)
+        }
         val pending = synchronized(lock) {
-            if (closed) return
+            if (closed) return closeCause!!
             closed = true
-            closeCause = cause
+            closeCause = terminal
             val list = waiters.values.toList()
             waiters.clear()
             list
         }
         for (waiter in pending) {
-            waiter.completeExceptionally(
-                CompanionConnectionClosedException("connection closed", cause),
-            )
+            waiter.completeExceptionally(terminal)
         }
-        transport.close()
+        runCatching { transport.close() }
+        terminationDeferred.complete(terminal)
+        return terminal
     }
 
     /** Close the connection and cancel all pending exchanges. */

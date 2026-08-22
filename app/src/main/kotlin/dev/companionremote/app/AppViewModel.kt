@@ -20,6 +20,7 @@ import dev.companionremote.app.i18n.EnglishStrings
 import dev.companionremote.app.i18n.currentSystemLanguage
 import dev.companionremote.app.i18n.resolveStrings
 import dev.companionremote.app.quick.RemoteTileService
+import dev.companionremote.app.quick.RemoteControlService
 import dev.companionremote.protocol.client.HidCommand
 import dev.companionremote.protocol.client.KeyboardFocusState
 import dev.companionremote.protocol.client.TouchPhase
@@ -120,6 +121,7 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
     private var pairSetup: PairSetup? = null
     private var pairingConnection: CompanionConnection? = null
     private var textSyncJob: Job? = null
+    private var nativeControlsStartJob: Job? = null
     private var isForeground = false
 
     /** Launchable apps (bundle id → name); null until loaded. */
@@ -154,7 +156,10 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
             settingsRepository.introSeen.collect { introSeen.value = it }
         }
         viewModelScope.launch {
-            settingsRepository.lockScreenControls.collect { lockScreenControls.value = it }
+            settingsRepository.lockScreenControls.collect {
+                lockScreenControls.value = it
+                if (it) startNativeControlsIfEligible()
+            }
         }
         viewModelScope.launch {
             remoteSession.keyboardFocus.collect { state ->
@@ -256,6 +261,7 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
             }
             val target = discovery.resolveByName(
                 name = name,
+                network = authorization.network,
                 authorizationStillValid = authorization::isStillValid,
             )
             if (target == null) {
@@ -263,7 +269,11 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
                 return@launch
             }
             val ok = runCatching {
-                val transport = SocketTransport.connect(target.host, target.port)
+                val transport = SocketTransport.connect(
+                    host = target.host,
+                    port = target.port,
+                    socketFactory = authorization.network.socketFactory,
+                )
                 val conn = CompanionConnection(transport)
                 conn.start()
                 PairVerify(conn, creds).verify()
@@ -445,11 +455,12 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
         apps.value = null
         appsError.value = null
         viewModelScope.launch {
-            if (establishHomeBindingOnSuccess) {
+            val connected = if (establishHomeBindingOnSuccess) {
                 remoteSession.connectUserSelected(device, credentials)
             } else {
                 remoteSession.connect(device, credentials)
             }
+            if (connected) startNativeControlsIfEligible()
         }
     }
 
@@ -460,6 +471,7 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
     /** Called when the remote screen returns to the foreground. */
     fun onForeground() {
         isForeground = true
+        startNativeControlsIfEligible()
         if (screen.value is Screen.Remote) {
             remoteSession.setUiOwner(true)
             if (connectionState.value == ConnectionState.Disconnected) reconnect()
@@ -469,7 +481,27 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
     /** Release a UI-only socket when the app is no longer visible. */
     fun onBackground() {
         isForeground = false
+        nativeControlsStartJob?.cancel()
+        nativeControlsStartJob = null
         remoteSession.setUiOwner(false)
+    }
+
+    /**
+     * A visible app is an Android-approved foreground-service launch point.
+     * Once the user has opted into lock-screen controls, opening CyberRemote
+     * on the bound LAN therefore restores the native MediaSession without an
+     * extra Play/Pause press or a second trip through the Quick Settings tile.
+     */
+    private fun startNativeControlsIfEligible() {
+        if (!isForeground || !lockScreenControls.value) return
+        nativeControlsStartJob?.cancel()
+        nativeControlsStartJob = viewModelScope.launch {
+            if (homeNetworkRepository.automaticAuthorization() == null) return@launch
+            if (!isForeground || !lockScreenControls.value) return@launch
+            val app = getApplication<Application>()
+            if (!RemoteControlService.notificationsEnabled(app)) return@launch
+            runCatching { RemoteControlService.start(app) }
+        }
     }
 
     fun closeRemote() {

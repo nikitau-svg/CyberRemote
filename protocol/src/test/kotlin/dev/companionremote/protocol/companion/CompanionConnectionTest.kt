@@ -1,13 +1,18 @@
 package dev.companionremote.protocol.companion
 
+import dev.companionremote.protocol.transport.Transport
+import java.io.IOException
+import java.util.concurrent.atomic.AtomicInteger
+import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.async
+import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.withTimeout
 import org.junit.jupiter.api.Assertions.assertArrayEquals
 import org.junit.jupiter.api.Assertions.assertEquals
-import org.junit.jupiter.api.Assertions.assertThrows
+import org.junit.jupiter.api.Assertions.assertSame
 import org.junit.jupiter.api.Assertions.assertTrue
 import org.junit.jupiter.api.Test
 
@@ -139,7 +144,65 @@ class CompanionConnectionTest {
         transport.incoming.close() // EOF from device
 
         val result = withTimeout(2000) { response.await() }
+        val terminal = withTimeout(2000) { connection.termination.await() }
         assertTrue(result.exceptionOrNull() is CompanionConnectionClosedException)
+        assertSame(terminal, result.exceptionOrNull())
+        assertEquals("connection closed by device", terminal.message)
+    }
+
+    @Test
+    fun `reader failure completes termination and fails pending exchanges`() = runBlocking {
+        val readFailure = IOException("read failed")
+        val allowFailure = CompletableDeferred<Unit>()
+        val writes = Channel<ByteArray>(Channel.UNLIMITED)
+        val transport = object : Transport {
+            override suspend fun read(): ByteArray? {
+                allowFailure.await()
+                throw readFailure
+            }
+
+            override suspend fun write(data: ByteArray) {
+                writes.send(data)
+            }
+
+            override fun close() = Unit
+        }
+        val connection = CompanionConnection(transport)
+        connection.start()
+
+        val response = async {
+            runCatching { connection.exchangeOpack(FrameType.E_OPACK, mapOf("_i" to "x", "_t" to 2L)) }
+        }
+        withTimeout(2000) { writes.receive() }
+        allowFailure.complete(Unit)
+
+        val terminal = withTimeout(2000) { connection.termination.await() }
+        val result = withTimeout(2000) { response.await() }
+        assertSame(readFailure, terminal.cause)
+        assertSame(terminal, result.exceptionOrNull())
+    }
+
+    @Test
+    fun `explicit close completes termination exactly once`() = runBlocking {
+        val transport = FakeTransport()
+        val connection = CompanionConnection(transport)
+        val completions = AtomicInteger()
+        connection.termination.invokeOnCompletion { completions.incrementAndGet() }
+        connection.start()
+
+        val response = async {
+            runCatching { connection.exchangeOpack(FrameType.E_OPACK, mapOf("_i" to "x", "_t" to 2L)) }
+        }
+        withTimeout(2000) { transport.nextWrite() }
+        connection.close()
+        val terminal = withTimeout(2000) { connection.termination.await() }
+        val result = withTimeout(2000) { response.await() }
+        connection.close()
+
+        assertEquals("closed by client", terminal.message)
+        assertSame(terminal, result.exceptionOrNull())
+        assertEquals(1, completions.get())
+        assertTrue(transport.closed)
     }
 
     @Test

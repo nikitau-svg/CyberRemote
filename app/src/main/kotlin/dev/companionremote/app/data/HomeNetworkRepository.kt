@@ -1,16 +1,23 @@
 package dev.companionremote.app.data
 
 import android.content.Context
+import android.net.Network
 import dev.companionremote.app.discovery.DiscoveredAtv
 import dev.companionremote.app.discovery.LocalNetworkIdentity
 
 /** A short-lived capability proving that automatic LAN access is allowed. */
 internal class HomeNetworkAuthorization(
     val binding: HomeNetworkBinding,
-    private val networkHandle: Long,
+    val network: Network,
     private val identity: LocalNetworkIdentity,
 ) {
-    fun isStillValid(): Boolean = identity.currentNetworkHandle() == networkHandle
+    /** A Network handle alone is insufficient: link properties can change in-place. */
+    fun isStillValid(): Boolean {
+        val current = identity.snapshot(network) ?: return false
+        return HomeNetworkPolicy.allowsAutomaticAccess(binding, current.fingerprint)
+    }
+
+    fun isFor(candidate: Network): Boolean = network == candidate
 }
 
 /**
@@ -25,7 +32,7 @@ internal class HomeNetworkRepository(context: Context) {
         val binding = settingsRepository.homeNetworkBinding() ?: return null
         val current = identity.current() ?: return null
         if (!HomeNetworkPolicy.allowsAutomaticAccess(binding, current.fingerprint)) return null
-        return HomeNetworkAuthorization(binding, current.networkHandle, identity)
+        return HomeNetworkAuthorization(binding, current.network, identity)
     }
 
     suspend fun automaticAuthorization(deviceIdentifier: ByteArray): HomeNetworkAuthorization? {
@@ -41,7 +48,7 @@ internal class HomeNetworkRepository(context: Context) {
         ) {
             return null
         }
-        return HomeNetworkAuthorization(binding, current.networkHandle, identity)
+        return HomeNetworkAuthorization(binding, current.network, identity)
     }
 
     /** Bind only after HAP pair-setup or pair-verify has authenticated the TV. */

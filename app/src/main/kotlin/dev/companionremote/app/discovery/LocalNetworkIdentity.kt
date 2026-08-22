@@ -16,8 +16,10 @@ import java.util.Base64
 /** An opaque, per-install identity for the currently attached physical LAN. */
 internal data class LocalNetworkSnapshot(
     val fingerprint: String,
-    val networkHandle: Long,
-)
+    val network: Network,
+) {
+    val networkHandle: Long get() = network.networkHandle
+}
 
 /**
  * Canonical input to the keyed fingerprint. Address strings exist only for
@@ -85,18 +87,20 @@ internal class LocalNetworkIdentity(context: Context) {
     fun current(): LocalNetworkSnapshot? {
         if (!hasLocalNetworkPermission()) return null
         val network = currentPhysicalNetwork() ?: return null
+        return snapshot(network)
+    }
+
+    /** Recomputes every fingerprint input for this exact Android Network. */
+    fun snapshot(network: Network): LocalNetworkSnapshot? {
+        if (!hasLocalNetworkPermission()) return null
         val capabilities = connectivityManager.getNetworkCapabilities(network) ?: return null
+        if (!capabilities.isPhysicalLan()) return null
         val links = connectivityManager.getLinkProperties(network) ?: return null
         val material = links.toFingerprintMaterial(capabilities)
         val fingerprint = runCatching {
             PrivateIdentityFingerprint.network(material, KeystoreHmac::sign)
         }.getOrNull() ?: return null
-        return LocalNetworkSnapshot(fingerprint, network.networkHandle)
-    }
-
-    fun currentNetworkHandle(): Long? {
-        if (!hasLocalNetworkPermission()) return null
-        return currentPhysicalNetwork()?.networkHandle
+        return LocalNetworkSnapshot(fingerprint, network)
     }
 
     fun deviceFingerprint(deviceIdentifier: ByteArray): String? =
@@ -129,13 +133,16 @@ internal class LocalNetworkIdentity(context: Context) {
         return candidates.firstOrNull { network ->
             val capabilities = connectivityManager.getNetworkCapabilities(network)
                 ?: return@firstOrNull false
-            capabilities.hasCapability(NetworkCapabilities.NET_CAPABILITY_NOT_VPN) &&
-                (
-                    capabilities.hasTransport(NetworkCapabilities.TRANSPORT_WIFI) ||
-                        capabilities.hasTransport(NetworkCapabilities.TRANSPORT_ETHERNET)
-                    )
+            capabilities.isPhysicalLan()
         }
     }
+
+    private fun NetworkCapabilities.isPhysicalLan(): Boolean =
+        hasCapability(NetworkCapabilities.NET_CAPABILITY_NOT_VPN) &&
+            (
+                hasTransport(NetworkCapabilities.TRANSPORT_WIFI) ||
+                    hasTransport(NetworkCapabilities.TRANSPORT_ETHERNET)
+                )
 
     private fun LinkProperties.toFingerprintMaterial(
         capabilities: NetworkCapabilities,

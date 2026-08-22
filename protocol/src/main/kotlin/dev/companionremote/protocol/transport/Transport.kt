@@ -2,6 +2,7 @@ package dev.companionremote.protocol.transport
 
 import java.net.InetSocketAddress
 import java.net.Socket
+import javax.net.SocketFactory
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 
@@ -28,11 +29,10 @@ class SocketTransport private constructor(private val socket: Socket) : Transpor
     private val buffer = ByteArray(8192)
 
     override suspend fun read(): ByteArray? = withContext(Dispatchers.IO) {
-        val n = try {
-            input.read(buffer)
-        } catch (e: Exception) {
-            -1
-        }
+        // EOF and an I/O failure are deliberately different here. The
+        // connection layer needs the original exception to report a useful
+        // termination cause and fail in-flight exchanges immediately.
+        val n = input.read(buffer)
         if (n < 0) null else buffer.copyOf(n)
     }
 
@@ -46,12 +46,25 @@ class SocketTransport private constructor(private val socket: Socket) : Transpor
     }
 
     companion object {
-        suspend fun connect(host: String, port: Int, timeoutMs: Int = 10_000): SocketTransport =
+        suspend fun connect(
+            host: String,
+            port: Int,
+            timeoutMs: Int = 10_000,
+            socketFactory: SocketFactory = SocketFactory.getDefault(),
+        ): SocketTransport =
             withContext(Dispatchers.IO) {
-                val socket = Socket()
-                socket.tcpNoDelay = true
-                socket.connect(InetSocketAddress(host, port), timeoutMs)
-                SocketTransport(socket)
+                // Android can pass Network.socketFactory here so the TCP
+                // socket stays on the selected network. JVM/CLI callers keep
+                // using the platform default.
+                val socket = socketFactory.createSocket()
+                try {
+                    socket.tcpNoDelay = true
+                    socket.connect(InetSocketAddress(host, port), timeoutMs)
+                    SocketTransport(socket)
+                } catch (cause: Throwable) {
+                    runCatching { socket.close() }
+                    throw cause
+                }
             }
     }
 }
