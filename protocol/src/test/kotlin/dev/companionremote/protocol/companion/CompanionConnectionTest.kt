@@ -145,8 +145,11 @@ class CompanionConnectionTest {
 
         val result = withTimeout(2000) { response.await() }
         val terminal = withTimeout(2000) { connection.termination.await() }
-        assertTrue(result.exceptionOrNull() is CompanionConnectionClosedException)
-        assertSame(terminal, result.exceptionOrNull())
+        val exchangeError = result.exceptionOrNull()
+        assertTrue(exchangeError is CompanionConnectionClosedException)
+        // Coroutine stack-trace recovery may copy exceptions, so compare the
+        // stable terminal semantics instead of JVM object identity.
+        assertEquals(terminal.message, exchangeError?.message)
         assertEquals("connection closed by device", terminal.message)
     }
 
@@ -179,7 +182,8 @@ class CompanionConnectionTest {
         val terminal = withTimeout(2000) { connection.termination.await() }
         val result = withTimeout(2000) { response.await() }
         assertSame(readFailure, terminal.cause)
-        assertSame(terminal, result.exceptionOrNull())
+        assertTrue(result.exceptionOrNull() is CompanionConnectionClosedException)
+        assertEquals(terminal.message, result.exceptionOrNull()?.message)
     }
 
     @Test
@@ -200,7 +204,8 @@ class CompanionConnectionTest {
         connection.close()
 
         assertEquals("closed by client", terminal.message)
-        assertSame(terminal, result.exceptionOrNull())
+        assertTrue(result.exceptionOrNull() is CompanionConnectionClosedException)
+        assertEquals(terminal.message, result.exceptionOrNull()?.message)
         assertEquals(1, completions.get())
         assertTrue(transport.closed)
     }
