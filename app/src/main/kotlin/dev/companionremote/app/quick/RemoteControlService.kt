@@ -22,6 +22,9 @@ import dev.companionremote.app.ConnectionState
 import dev.companionremote.app.R
 import dev.companionremote.app.RemoteSessionManager
 import dev.companionremote.app.data.SettingsRepository
+import dev.companionremote.app.diagnostics.Diagnostics
+import dev.companionremote.app.diagnostics.Diagnostics.DiagnosticToken
+import dev.companionremote.app.diagnostics.Diagnostics.RuntimePlayback
 import java.util.UUID
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -59,7 +62,20 @@ class RemoteControlService : Service() {
         session = RemoteSessionManager.get(this)
         settings = SettingsRepository(this)
         keyguard = getSystemService(KeyguardManager::class.java)
-        RemoteNotification.createChannel(this)
+        try {
+            RemoteNotification.createChannel(this)
+        } catch (error: RuntimeException) {
+            Diagnostics.exception(this, "notification", "create_channel", error)
+            throw error
+        }
+        Diagnostics.updateRuntimeState(
+            serviceRunning = true,
+            foregroundStarted = false,
+            mediaSessionActive = false,
+            playback = RuntimePlayback.Unknown,
+            keyguardLocked = keyguard.isKeyguardLocked,
+        )
+        Diagnostics.record(this, "remote_service", "created", "sdk" to Build.VERSION.SDK_INT)
 
         scope.launch {
             for (queued in commandQueue) executeAction(queued)
@@ -75,6 +91,19 @@ class RemoteControlService : Service() {
             }.collect { snapshot ->
                 lastSnapshot = snapshot
                 lockScreenControlsEnabled = snapshot.lockScreenControlsEnabled
+                Diagnostics.updateRuntimeState(
+                    lockScreenControls = snapshot.lockScreenControlsEnabled,
+                    keyguardLocked = keyguard.isKeyguardLocked,
+                    connection = DiagnosticToken(snapshot.state.name),
+                )
+                Diagnostics.record(
+                    this@RemoteControlService,
+                    "remote_service",
+                    "snapshot",
+                    "connection" to snapshot.state,
+                    "lock_controls" to snapshot.lockScreenControlsEnabled,
+                    "has_error" to (snapshot.error != null),
+                )
                 updateMediaSession(snapshot)
                 refreshNotification()
                 TileService.requestListeningState(
@@ -86,19 +115,46 @@ class RemoteControlService : Service() {
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+        val commandKind = when (intent?.action) {
+            ACTION_START -> "start"
+            ACTION_COMMAND -> "command"
+            ACTION_STOP -> "stop"
+            null -> "null_restart"
+            else -> "unknown"
+        }
+        Diagnostics.record(
+            this,
+            "remote_service",
+            "start_command",
+            "kind" to DiagnosticToken(commandKind),
+            "locked" to keyguard.isKeyguardLocked,
+            "foreground" to foregroundStarted,
+        )
         if (intent?.action == ACTION_STOP) {
             val requestedCapability = intent.getStringExtra(EXTRA_CAPABILITY)
             if (!isControlLeaseActive(requestedCapability.orEmpty())) {
+                Diagnostics.record(
+                    this,
+                    "remote_service",
+                    "stop_rejected",
+                    "reason" to DiagnosticToken("stale_lease"),
+                )
                 if (!foregroundStarted) stopSelf()
                 return START_NOT_STICKY
             }
-            stopRemote()
+            stopRemote("action_stop")
             return START_NOT_STICKY
         }
 
         if (intent?.action == ACTION_COMMAND) {
             if (!acceptingCommands || intent.getStringExtra(EXTRA_CAPABILITY) != capabilityToken) {
-                if (!foregroundStarted) stopRemote()
+                Diagnostics.record(
+                    this,
+                    "remote_service",
+                    "command_rejected",
+                    "reason" to DiagnosticToken("inactive_or_stale"),
+                )
+                if (!foregroundStarted) stopRemote("invalid_command")
                 return START_NOT_STICKY
             }
             QuickRemoteAction.fromWireValue(intent.getStringExtra(EXTRA_COMMAND))
@@ -115,7 +171,13 @@ class RemoteControlService : Service() {
                     !RemoteControlLeaseRegistry.isActive(expectedCapability)
             )
         ) {
-            if (!foregroundStarted) stopRemote()
+            Diagnostics.record(
+                this,
+                "remote_service",
+                "start_rejected",
+                "reason" to DiagnosticToken("stale_expected_lease"),
+            )
+            if (!foregroundStarted) stopRemote("stale_expected_lease")
             return START_NOT_STICKY
         }
 
@@ -143,6 +205,7 @@ class RemoteControlService : Service() {
     override fun onBind(intent: Intent?): IBinder? = null
 
     override fun onDestroy() {
+        Diagnostics.record(this, "remote_service", "destroyed", "foreground" to foregroundStarted)
         if (foregroundStarted) stopForeground(STOP_FOREGROUND_REMOVE)
         foregroundStarted = false
         getSystemService(NotificationManager::class.java).cancel(NOTIFICATION_ID)
@@ -152,24 +215,38 @@ class RemoteControlService : Service() {
         connectJob?.cancel()
         connectJob = null
         releaseMediaSession()
+        Diagnostics.updateRuntimeState(
+            serviceRunning = false,
+            foregroundStarted = false,
+            mediaSessionActive = false,
+            playback = RuntimePlayback.Released,
+        )
         session.setQuickRemoteOwner(false)
         scope.cancel()
         super.onDestroy()
+    }
+
+    override fun onTaskRemoved(rootIntent: Intent?) {
+        Diagnostics.record(this, "remote_service", "task_removed")
+        super.onTaskRemoved(rootIntent)
     }
 
     private fun createMediaSession(leaseToken: String): MediaSession =
         MediaSession(this, "CyberRemote").apply {
             setCallback(object : MediaSession.Callback() {
                 override fun onPlay() {
+                    Diagnostics.record(this@RemoteControlService, "media_session", "callback_play")
                     if (isControlLeaseActive(leaseToken)) enqueuePlayPause()
                 }
 
                 override fun onPause() {
+                    Diagnostics.record(this@RemoteControlService, "media_session", "callback_pause")
                     if (isControlLeaseActive(leaseToken)) enqueuePlayPause()
                 }
 
                 override fun onStop() {
-                    if (isControlLeaseActive(leaseToken)) stopRemote()
+                    Diagnostics.record(this@RemoteControlService, "media_session", "callback_stop")
+                    if (isControlLeaseActive(leaseToken)) stopRemote("media_callback")
                 }
 
                 override fun onCustomAction(action: String, extras: Bundle?) {
@@ -188,6 +265,8 @@ class RemoteControlService : Service() {
                 ),
             )
             isActive = true
+            Diagnostics.updateRuntimeState(mediaSessionActive = true)
+            Diagnostics.record(this@RemoteControlService, "media_session", "active")
         }
 
     private fun isControlLeaseActive(leaseToken: String): Boolean =
@@ -196,12 +275,15 @@ class RemoteControlService : Service() {
             RemoteControlLeaseRegistry.isActive(leaseToken)
 
     private fun releaseMediaSession() {
+        val existed = mediaSession != null
         mediaSession?.let { current ->
             current.setCallback(null)
             current.isActive = false
             current.release()
         }
         mediaSession = null
+        Diagnostics.updateRuntimeState(mediaSessionActive = false, playback = RuntimePlayback.Released)
+        Diagnostics.record(this, "media_session", "released", "existed" to existed)
     }
 
     private fun enqueuePlayPause() {
@@ -209,11 +291,38 @@ class RemoteControlService : Service() {
     }
 
     private fun enqueueAction(action: QuickRemoteAction) {
-        if (!acceptingCommands) return
+        if (!acceptingCommands) {
+            Diagnostics.record(
+                this,
+                "remote_service",
+                "command_rejected",
+                "reason" to DiagnosticToken("not_accepting"),
+                "action" to action,
+            )
+            return
+        }
         val locked = keyguard.isKeyguardLocked
         if (locked) {
-            if (!LockScreenRemotePolicy.canExecute(action, true, lockScreenControlsEnabled)) return
-            if (!ingressRateLimiter.tryAcquire(action)) return
+            if (!LockScreenRemotePolicy.canExecute(action, true, lockScreenControlsEnabled)) {
+                Diagnostics.record(
+                    this,
+                    "remote_service",
+                    "command_rejected",
+                    "reason" to DiagnosticToken("lock_policy"),
+                    "action" to action,
+                )
+                return
+            }
+            if (!ingressRateLimiter.tryAcquire(action)) {
+                Diagnostics.record(
+                    this,
+                    "remote_service",
+                    "command_rejected",
+                    "reason" to DiagnosticToken("rate_limit"),
+                    "action" to action,
+                )
+                return
+            }
         }
         commandQueue.trySend(
             QueuedAction(
@@ -223,22 +332,39 @@ class RemoteControlService : Service() {
                 capabilityToken = capabilityToken,
             ),
         )
+        Diagnostics.record(
+            this,
+            "remote_service",
+            "command_queued",
+            "action" to action,
+            "locked" to locked,
+        )
     }
 
     private suspend fun executeAction(queued: QueuedAction) {
-        if (queued.capabilityToken != capabilityToken) return
+        if (queued.capabilityToken != capabilityToken) {
+            Diagnostics.record(this, "remote_service", "command_dropped", "reason" to DiagnosticToken("lease_changed"))
+            return
+        }
         val maxAge = if (queued.wasLockedAtIngress) {
             LOCKED_COMMAND_MAX_AGE_MS
         } else {
             UNLOCKED_COMMAND_MAX_AGE_MS
         }
         val remainingAge = maxAge - (SystemClock.elapsedRealtime() - queued.issuedAtElapsedMs)
-        if (remainingAge <= 0L) return
+        if (remainingAge <= 0L) {
+            Diagnostics.record(this, "remote_service", "command_dropped", "reason" to DiagnosticToken("expired"))
+            return
+        }
 
         val action = queued.action
         if (queued.wasLockedAtIngress) {
-            if (!LockScreenRemotePolicy.canExecute(action, true, lockScreenControlsEnabled)) return
+            if (!LockScreenRemotePolicy.canExecute(action, true, lockScreenControlsEnabled)) {
+                Diagnostics.record(this, "remote_service", "command_dropped", "reason" to DiagnosticToken("lock_policy_changed"), "action" to action)
+                return
+            }
         } else if (keyguard.isKeyguardLocked) {
+            Diagnostics.record(this, "remote_service", "command_dropped", "reason" to DiagnosticToken("locked_after_ingress"), "action" to action)
             return
         }
 
@@ -250,6 +376,14 @@ class RemoteControlService : Service() {
             authorizationStillValid = {
                 acceptingCommands && queued.capabilityToken == capabilityToken
             },
+        )
+        Diagnostics.record(
+            this,
+            "remote_service",
+            "command_result",
+            "action" to action,
+            "success" to succeeded,
+            "locked" to queued.wasLockedAtIngress,
         )
         if (succeeded && action == QuickRemoteAction.PlayPause) {
             // Companion exposes no Now Playing state. This toggles only the local
@@ -291,57 +425,113 @@ class RemoteControlService : Service() {
                 )
                 .build(),
         )
+        val playback = if (optimisticPlaying) RuntimePlayback.Playing else RuntimePlayback.Paused
+        Diagnostics.updateRuntimeState(
+            mediaSessionActive = currentSession.isActive,
+            playback = playback,
+            connection = DiagnosticToken(snapshot.state.name),
+            lockScreenControls = snapshot.lockScreenControlsEnabled,
+            keyguardLocked = keyguard.isKeyguardLocked,
+        )
+        Diagnostics.record(
+            this,
+            "media_session",
+            "state_updated",
+            "playback" to playback,
+            "connection" to snapshot.state,
+        )
     }
 
     private fun ensureForeground() {
-        if (foregroundStarted) return
-        val currentSession = mediaSession ?: return
-        startForeground(
-            NOTIFICATION_ID,
-            RemoteNotification.build(
+        if (foregroundStarted) {
+            Diagnostics.record(this, "notification", "foreground_already_started")
+            return
+        }
+        val currentSession = mediaSession ?: run {
+            Diagnostics.record(
                 this,
-                lastSnapshot,
-                currentSession.sessionToken,
-                optimisticPlaying,
-                capabilityToken,
-            ),
-        )
-        foregroundStarted = true
+                "notification",
+                "foreground_skipped",
+                "reason" to DiagnosticToken("no_media_session"),
+            )
+            return
+        }
+        Diagnostics.record(this, "notification", "foreground_start_attempt")
+        try {
+            startForeground(
+                NOTIFICATION_ID,
+                RemoteNotification.build(
+                    this,
+                    lastSnapshot,
+                    currentSession.sessionToken,
+                    optimisticPlaying,
+                    capabilityToken,
+                ),
+            )
+            foregroundStarted = true
+            Diagnostics.updateRuntimeState(foregroundStarted = true)
+            Diagnostics.record(this, "notification", "foreground_started", "id" to NOTIFICATION_ID)
+        } catch (error: RuntimeException) {
+            Diagnostics.exception(this, "notification", "start_foreground", error)
+            throw error
+        }
     }
 
     private fun refreshNotification() {
         if (!foregroundStarted) return
         val currentSession = mediaSession ?: return
-        getSystemService(NotificationManager::class.java).notify(
-            NOTIFICATION_ID,
-            RemoteNotification.build(
-                this,
-                lastSnapshot,
-                currentSession.sessionToken,
-                optimisticPlaying,
-                capabilityToken,
-            ),
-        )
+        try {
+            getSystemService(NotificationManager::class.java).notify(
+                NOTIFICATION_ID,
+                RemoteNotification.build(
+                    this,
+                    lastSnapshot,
+                    currentSession.sessionToken,
+                    optimisticPlaying,
+                    capabilityToken,
+                ),
+            )
+            Diagnostics.record(this, "notification", "refreshed", "id" to NOTIFICATION_ID)
+        } catch (error: RuntimeException) {
+            Diagnostics.exception(this, "notification", "refresh", error)
+            throw error
+        }
     }
 
-    private fun stopRemote() {
+    private fun stopRemote(reason: String) {
+        Diagnostics.updateRuntimeState(lastStopReason = DiagnosticToken(reason))
+        Diagnostics.record(this, "remote_service", "stopping", "reason" to DiagnosticToken(reason))
         acceptingCommands = false
         connectJob?.cancel()
         connectJob = null
         releaseMediaSession()
         revokeCapabilities()
         foregroundStarted = false
+        Diagnostics.updateRuntimeState(foregroundStarted = false)
         session.setQuickRemoteOwner(false)
         stopForeground(STOP_FOREGROUND_REMOVE)
         stopSelf()
     }
 
     private fun activateControlLease() {
-        if (acceptingCommands) return
+        if (acceptingCommands) {
+            Diagnostics.record(this, "remote_service", "lease_already_active")
+            return
+        }
         acceptingCommands = true
         RemoteControlLeaseRegistry.activate(capabilityToken)
         session.setQuickRemoteOwner(true)
-        mediaSession = createMediaSession(capabilityToken)
+        Diagnostics.record(this, "media_session", "creating")
+        mediaSession = try {
+            createMediaSession(capabilityToken)
+        } catch (error: RuntimeException) {
+            Diagnostics.exception(this, "media_session", "create", error)
+            acceptingCommands = false
+            revokeCapabilities()
+            session.setQuickRemoteOwner(false)
+            throw error
+        }
+        Diagnostics.record(this, "remote_service", "lease_activated")
         updateMediaSession(lastSnapshot)
     }
 
@@ -365,14 +555,27 @@ class RemoteControlService : Service() {
         private const val MEDIA_VOLUME_UP = "dev.companionremote.media.VOLUME_UP"
 
         fun start(context: Context, expectedCapability: String? = null) {
+            Diagnostics.record(
+                context,
+                "service_api",
+                "start_requested",
+                "expected_lease" to (expectedCapability != null),
+            )
             val intent = Intent(context, RemoteControlService::class.java).setAction(ACTION_START)
             if (expectedCapability != null) {
                 intent.putExtra(EXTRA_EXPECTED_CAPABILITY, expectedCapability)
             }
-            context.startForegroundService(intent)
+            try {
+                context.startForegroundService(intent)
+            } catch (error: RuntimeException) {
+                Diagnostics.exception(context, "service_api", "start_foreground_service", error)
+                throw error
+            }
         }
 
         fun stop(context: Context) {
+            Diagnostics.record(context, "service_api", "stop_requested")
+            Diagnostics.updateRuntimeState(lastStopReason = DiagnosticToken("api_stop"))
             context.stopService(Intent(context, RemoteControlService::class.java))
         }
 
@@ -431,6 +634,7 @@ private object RemoteNotification {
                 lockscreenVisibility = Notification.VISIBILITY_PUBLIC
             },
         )
+        Diagnostics.record(context, "notification", "channel_ensured")
     }
 
     fun notificationsEnabled(context: Context): Boolean {

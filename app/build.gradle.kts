@@ -14,8 +14,8 @@ android {
         applicationId = "dev.companionremote.nikita"
         minSdk = 26
         targetSdk = 35
-        versionCode = 6
-        versionName = "1.2.0-native-controls"
+        versionCode = 7
+        versionName = "1.2.1-diagnostics"
     }
 
     buildTypes {

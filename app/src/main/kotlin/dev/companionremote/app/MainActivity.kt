@@ -19,6 +19,7 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
 import dev.companionremote.app.data.AppSkin
 import dev.companionremote.app.data.ThemeMode
+import dev.companionremote.app.diagnostics.Diagnostics
 import dev.companionremote.app.i18n.LocalAppStrings
 import dev.companionremote.app.i18n.currentSystemLanguage
 import dev.companionremote.app.i18n.resolveStrings
@@ -37,6 +38,7 @@ class MainActivity : ComponentActivity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        Diagnostics.record(this, "main_activity", "created")
         setContent {
             val themeMode by viewModel.themeMode.collectAsState()
             val skin by viewModel.skin.collectAsState()
@@ -75,10 +77,12 @@ class MainActivity : ComponentActivity() {
 
     override fun onStart() {
         super.onStart()
+        Diagnostics.record(this, "main_activity", "started")
         viewModel.onForeground()
     }
 
     override fun onStop() {
+        Diagnostics.record(this, "main_activity", "stopped")
         viewModel.onBackground()
         super.onStop()
     }

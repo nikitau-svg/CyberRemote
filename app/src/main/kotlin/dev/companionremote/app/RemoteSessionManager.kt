@@ -9,6 +9,8 @@ import dev.companionremote.app.data.CredentialsRepository
 import dev.companionremote.app.data.SettingsRepository
 import dev.companionremote.app.discovery.AtvDiscovery
 import dev.companionremote.app.discovery.DiscoveredAtv
+import dev.companionremote.app.diagnostics.Diagnostics
+import dev.companionremote.app.diagnostics.Diagnostics.DiagnosticToken
 import dev.companionremote.app.quick.LockScreenRemotePolicy
 import dev.companionremote.app.quick.LockedRemoteRateLimiter
 import dev.companionremote.app.quick.QuickRemoteAction
@@ -104,6 +106,7 @@ class RemoteSessionManager private constructor(context: Context) {
                     request.result?.cancel(e)
                     throw e
                 } catch (e: Exception) {
+                    Diagnostics.exception(appContext, "remote_session", "command_loop", e)
                     _connectionState.value = ConnectionState.Disconnected
                     _connectionError.value = friendlyError(e)
                     request.result?.complete(false)
@@ -111,10 +114,15 @@ class RemoteSessionManager private constructor(context: Context) {
             }
         }
         scope.launch {
-            settingsRepository.lockScreenControls.collect { lockScreenControlsEnabled = it }
+            settingsRepository.lockScreenControls.collect {
+                lockScreenControlsEnabled = it
+                Diagnostics.updateRuntimeState(lockScreenControls = it)
+            }
         }
         scope.launch {
-            connectionState.collect {
+            connectionState.collect { state ->
+                Diagnostics.updateRuntimeState(connection = DiagnosticToken(state.name))
+                Diagnostics.record(appContext, "remote_session", "connection", "state" to state)
                 TileService.requestListeningState(
                     appContext,
                     ComponentName(appContext, RemoteTileService::class.java),

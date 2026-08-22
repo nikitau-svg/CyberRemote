@@ -12,6 +12,7 @@ import dev.companionremote.app.data.SettingsRepository
 import dev.companionremote.app.data.ThemeMode
 import dev.companionremote.app.discovery.AtvDiscovery
 import dev.companionremote.app.discovery.DiscoveredAtv
+import dev.companionremote.app.diagnostics.Diagnostics
 import dev.companionremote.app.i18n.AppLanguage
 import dev.companionremote.app.i18n.AppStrings
 import dev.companionremote.app.i18n.EnglishStrings
@@ -26,9 +27,11 @@ import dev.companionremote.protocol.hap.HapCredentials
 import dev.companionremote.protocol.hap.PairSetup
 import dev.companionremote.protocol.hap.PairVerify
 import dev.companionremote.protocol.transport.SocketTransport
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 
 /** Which screen is showing. */
 sealed interface Screen {
@@ -87,6 +90,9 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
 
     /** Safe lock-screen controls are disabled until the user explicitly opts in. */
     val lockScreenControls = MutableStateFlow(false)
+
+    /** Human-readable, redacted diagnostics shown in Settings. */
+    val diagnosticsReport = MutableStateFlow("")
 
     // Where to return when leaving Settings (device list or the remote).
     private var settingsReturnTo: Screen = Screen.DeviceList
@@ -191,6 +197,8 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     fun setLockScreenControls(enabled: Boolean) {
+        Diagnostics.updateRuntimeState(lockScreenControls = enabled)
+        Diagnostics.record(getApplication(), "settings", "lock_controls_changed", "enabled" to enabled)
         viewModelScope.launch { settingsRepository.setLockScreenControls(enabled) }
     }
 
@@ -199,8 +207,29 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
         viewModelScope.launch {
             pairedDevices.value = credentialsRepository.pairedDeviceNames().sorted()
             deviceVerify.value = emptyMap()
+            refreshDiagnostics()
             screen.value = Screen.Settings
         }
+    }
+
+    suspend fun refreshDiagnostics(): String {
+        val report = withContext(Dispatchers.IO) {
+            runCatching {
+                Diagnostics.snapshotReport(getApplication())
+            }.getOrElse { error ->
+                "Diagnostics unavailable (${error.javaClass.simpleName})"
+            }
+        }
+        diagnosticsReport.value = report
+        return report
+    }
+
+    suspend fun clearDiagnostics(): Boolean {
+        val cleared = withContext(Dispatchers.IO) {
+            runCatching { Diagnostics.clear(getApplication()) }.getOrDefault(false)
+        }
+        refreshDiagnostics()
+        return cleared
     }
 
     /** Re-check that a paired device is reachable and its pairing still valid. */

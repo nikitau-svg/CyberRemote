@@ -79,6 +79,8 @@ import dev.companionremote.app.ConnectionState
 import dev.companionremote.app.R
 import dev.companionremote.app.RemoteSessionManager
 import dev.companionremote.app.data.SettingsRepository
+import dev.companionremote.app.diagnostics.Diagnostics
+import dev.companionremote.app.diagnostics.Diagnostics.DiagnosticToken
 import kotlin.math.abs
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
@@ -107,6 +109,7 @@ class FullRemoteActivity : ComponentActivity() {
         ActivityResultContracts.RequestPermission(),
     ) { granted ->
         notificationPermissionRequestInProgress = false
+        Diagnostics.record(this, "full_remote", "notification_permission_result", "granted" to granted)
         if (granted && acceptingActivityCommands && !keyguard.isKeyguardLocked) {
             connectUnlocked()
         }
@@ -117,6 +120,7 @@ class FullRemoteActivity : ComponentActivity() {
         launchCapabilityRequired = intent.getBooleanExtra(EXTRA_REQUIRE_LAUNCH_CAPABILITY, false)
         launchCapability = intent.getStringExtra(EXTRA_LAUNCH_CAPABILITY)
         if (launchCapabilityRequired && !RemoteControlLeaseRegistry.isActive(launchCapability)) {
+            Diagnostics.record(this, "full_remote", "create_rejected", "reason" to DiagnosticToken("stale_lease"))
             finish()
             return
         }
@@ -124,6 +128,14 @@ class FullRemoteActivity : ComponentActivity() {
         settings = SettingsRepository(this)
         keyguard = getSystemService(KeyguardManager::class.java)
         keyguardLockedState.value = keyguard.isKeyguardLocked
+        Diagnostics.updateRuntimeState(keyguardLocked = keyguard.isKeyguardLocked)
+        Diagnostics.record(
+            this,
+            "full_remote",
+            "created",
+            "locked" to keyguard.isKeyguardLocked,
+            "capability_required" to launchCapabilityRequired,
+        )
 
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O_MR1) {
             setShowWhenLocked(true)
@@ -139,6 +151,11 @@ class FullRemoteActivity : ComponentActivity() {
         lifecycleScope.launch {
             settings.lockScreenControls.collect { enabled ->
                 lockScreenControls.value = enabled
+                Diagnostics.updateRuntimeState(
+                    lockScreenControls = enabled,
+                    keyguardLocked = keyguard.isKeyguardLocked,
+                )
+                Diagnostics.record(this@FullRemoteActivity, "full_remote", "lock_setting", "enabled" to enabled)
                 if (!enabled && keyguard.isKeyguardLocked) requestUnlock(null)
             }
         }
@@ -175,6 +192,14 @@ class FullRemoteActivity : ComponentActivity() {
     override fun onStart() {
         super.onStart()
         keyguardLockedState.value = keyguard.isKeyguardLocked
+        Diagnostics.updateRuntimeState(keyguardLocked = keyguard.isKeyguardLocked)
+        Diagnostics.record(
+            this,
+            "full_remote",
+            "started",
+            "locked" to keyguard.isKeyguardLocked,
+            "lock_controls" to (lockScreenControls.value == true),
+        )
         if (launchCapabilityRequired && !RemoteControlLeaseRegistry.isActive(launchCapability)) {
             finish()
             return
@@ -185,7 +210,17 @@ class FullRemoteActivity : ComponentActivity() {
         keyguardMonitorJob?.cancel()
         keyguardMonitorJob = lifecycleScope.launch {
             while (isActive) {
-                keyguardLockedState.value = keyguard.isKeyguardLocked
+                val locked = keyguard.isKeyguardLocked
+                if (locked != keyguardLockedState.value) {
+                    keyguardLockedState.value = locked
+                    Diagnostics.updateRuntimeState(keyguardLocked = locked)
+                    Diagnostics.record(
+                        this@FullRemoteActivity,
+                        "full_remote",
+                        "keyguard_changed",
+                        "locked" to locked,
+                    )
+                }
                 delay(KEYGUARD_POLL_MS)
             }
         }
@@ -206,6 +241,7 @@ class FullRemoteActivity : ComponentActivity() {
     }
 
     override fun onStop() {
+        Diagnostics.record(this, "full_remote", "stopped", "locked" to keyguard.isKeyguardLocked)
         keyguardMonitorJob?.cancel()
         keyguardMonitorJob = null
         invalidateActivityLease()
@@ -214,6 +250,7 @@ class FullRemoteActivity : ComponentActivity() {
     }
 
     override fun onDestroy() {
+        Diagnostics.record(this, "full_remote", "destroyed")
         invalidateActivityLease()
         super.onDestroy()
     }
@@ -224,40 +261,72 @@ class FullRemoteActivity : ComponentActivity() {
             checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED
         ) {
             if (!notificationPermissionRequestInProgress) {
+                Diagnostics.record(this, "full_remote", "service_start_deferred", "reason" to DiagnosticToken("notification_permission"))
                 notificationPermissionRequestInProgress = true
                 notificationPermission.launch(Manifest.permission.POST_NOTIFICATIONS)
             }
             return
         }
         val expectedCapability = launchCapability.takeIf { launchCapabilityRequired }
+        Diagnostics.record(
+            this,
+            "full_remote",
+            "service_start",
+            "expected_lease" to (expectedCapability != null),
+        )
         runCatching { RemoteControlService.start(this, expectedCapability) }
+            .onFailure { Diagnostics.exception(this, "full_remote", "service_start", it) }
     }
 
     private fun dispatch(action: QuickRemoteAction) {
         val lease = currentActivityLease()
         val locked = keyguard.isKeyguardLocked
         val enabled = lockScreenControls.value == true
+        Diagnostics.record(
+            this,
+            "full_remote",
+            "command_attempt",
+            "action" to action,
+            "locked" to locked,
+            "lock_controls" to enabled,
+        )
         if (!LockScreenRemotePolicy.canExecute(action, locked, enabled)) {
+            Diagnostics.record(this, "full_remote", "command_requires_unlock", "action" to action)
             requestUnlock(action)
             return
         }
         if (locked && session.connectionState.value != ConnectionState.Connected) {
+            Diagnostics.record(this, "full_remote", "command_requires_unlock", "reason" to DiagnosticToken("not_connected"), "action" to action)
             requestUnlock(action)
             return
         }
 
         lifecycleScope.launch {
-            action.execute(
+            val succeeded = action.execute(
                 session = session,
                 requireUnlocked = !locked,
                 allowReconnect = !locked,
                 maxAgeMs = if (locked) LOCKED_COMMAND_MAX_AGE_MS else UNLOCKED_COMMAND_MAX_AGE_MS,
                 authorizationStillValid = { isActivityLeaseValid(lease) },
             )
+            Diagnostics.record(
+                this@FullRemoteActivity,
+                "full_remote",
+                "command_result",
+                "action" to action,
+                "success" to succeeded,
+                "locked" to locked,
+            )
         }
     }
 
     private fun requestUnlock(action: QuickRemoteAction?) {
+        Diagnostics.record(
+            this,
+            "full_remote",
+            "unlock_requested",
+            "has_action" to (action != null),
+        )
         if (!keyguard.isKeyguardLocked) {
             action?.let(::dispatch)
             return
@@ -271,6 +340,7 @@ class FullRemoteActivity : ComponentActivity() {
             this,
             object : KeyguardManager.KeyguardDismissCallback() {
                 override fun onDismissSucceeded() {
+                    Diagnostics.record(this@FullRemoteActivity, "full_remote", "unlock_succeeded")
                     if (requestId != unlockRequestGeneration) return
                     keyguardLockedState.value = keyguard.isKeyguardLocked
                     authenticationInProgress = false
@@ -294,8 +364,15 @@ class FullRemoteActivity : ComponentActivity() {
                     }
                 }
 
-                override fun onDismissCancelled() = finishUnlockAttempt(requestId)
-                override fun onDismissError() = finishUnlockAttempt(requestId)
+                override fun onDismissCancelled() {
+                    Diagnostics.record(this@FullRemoteActivity, "full_remote", "unlock_cancelled")
+                    finishUnlockAttempt(requestId)
+                }
+
+                override fun onDismissError() {
+                    Diagnostics.record(this@FullRemoteActivity, "full_remote", "unlock_error")
+                    finishUnlockAttempt(requestId)
+                }
             },
         )
     }
