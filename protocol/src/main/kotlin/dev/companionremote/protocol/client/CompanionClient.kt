@@ -96,7 +96,7 @@ class CompanionClient(
         subscribeEvent(NOW_PLAYING_EVENT)
         // tvOS 18+ prepares and pushes a richer NowPlayingInfo payload a
         // little later. Older versions safely ignore this fire-and-forget.
-        sendEvent(FETCH_NOW_PLAYING_EVENT, emptyMap())
+        refreshNowPlaying()
     }
 
     /** Graceful teardown mirroring pyatv `CompanionAPI.disconnect`. */
@@ -422,6 +422,17 @@ class CompanionClient(
 
     suspend fun pause() {
         mediaControl(MediaControlCommand.Pause)
+    }
+
+    /**
+     * Ask an already-connected Apple TV to push its current Now Playing state.
+     *
+     * This is deliberately a single fire-and-forget protocol event. Callers
+     * that want another best-effort attempt must request it explicitly; this
+     * method never reconnects, toggles playback or starts a polling loop.
+     */
+    suspend fun refreshNowPlaying() {
+        sendEvent(FETCH_NOW_PLAYING_EVENT, emptyMap())
     }
 
     // Plumbing

@@ -32,6 +32,7 @@ import dev.companionremote.app.RemoteSessionManager
 import dev.companionremote.app.data.SettingsRepository
 import dev.companionremote.app.data.HomeNetworkAuthorization
 import dev.companionremote.app.data.HomeNetworkRepository
+import dev.companionremote.app.discovery.LocalNetworkIdentity
 import dev.companionremote.app.diagnostics.Diagnostics
 import dev.companionremote.app.diagnostics.Diagnostics.DiagnosticToken
 import dev.companionremote.app.diagnostics.Diagnostics.RuntimePlayback
@@ -42,6 +43,9 @@ import dev.companionremote.app.nowplaying.PlaybackStatus
 import dev.companionremote.app.nowplaying.commandFor
 import java.io.ByteArrayOutputStream
 import java.net.HttpURLConnection
+import java.net.Inet4Address
+import java.net.Inet6Address
+import java.net.InetAddress
 import java.net.URL
 import java.util.UUID
 import kotlinx.coroutines.CoroutineScope
@@ -65,12 +69,22 @@ class RemoteControlService : Service() {
     private var artworkJob: Job? = null
     private var networkRevalidationJob: Job? = null
     private var reconnectRetryJob: Job? = null
+    private var departureGraceJob: Job? = null
+    private var awayStopJob: Job? = null
+    private var nowPlayingRefreshJob: Job? = null
+    private var mediaSessionRetryJob: Job? = null
+    private var networkRevalidationGeneration = 0L
     private lateinit var session: RemoteSessionManager
     private lateinit var settings: SettingsRepository
     private lateinit var homeNetworks: HomeNetworkRepository
     private lateinit var connectivityManager: ConnectivityManager
     private lateinit var keyguard: KeyguardManager
+    private val lifecyclePreferences by lazy {
+        getSharedPreferences(LIFECYCLE_PREFERENCES, Context.MODE_PRIVATE)
+    }
     private var mediaSession: MediaSession? = null
+    private var mediaSessionCreationFailed = false
+    private var mediaSessionCreationFailures = 0
     private var foregroundStarted = false
     @Volatile private var acceptingCommands = false
     private var lockScreenControlsEnabled = false
@@ -80,7 +94,9 @@ class RemoteControlService : Service() {
     private var homeAuthorization: HomeNetworkAuthorization? = null
     private var networkReconnectArmed = false
     private val homeNetworkPolicy = HomeNetworkServicePolicy()
+    private val hybridHomeNetworkPolicy = HybridHomeNetworkPolicy()
     private val reconnectBackoff = BoundedReconnectBackoff()
+    private val networkCallbackGate = NetworkCallbackRevalidationGate()
     private var lastObservedConnectionState = ConnectionState.Disconnected
     @Volatile private var capabilityToken = UUID.randomUUID().toString()
     private var lastSnapshot = NotificationSnapshot(
@@ -143,7 +159,10 @@ class RemoteControlService : Service() {
                     "now_playing" to snapshot.nowPlaying.status,
                     "now_playing_source" to snapshot.nowPlaying.source,
                 )
-                updateArtwork(snapshot.nowPlaying.artwork)
+                reconcileMediaPresentation(snapshot)
+                updateArtwork(
+                    snapshot.nowPlaying.artwork.takeIf { shouldPresentMedia(snapshot) },
+                )
                 updateMediaSession(snapshot)
                 refreshNotification()
                 handleConnectionLifecycle(snapshot.state)
@@ -222,27 +241,57 @@ class RemoteControlService : Service() {
             return START_NOT_STICKY
         }
 
-        activateControlLease()
+        if (intent?.action == ACTION_START && !acceptingCommands) {
+            // A deliberate fresh user start begins a new bounded lifecycle.
+            clearPersistedAwayDeadline()
+        }
+        val controlLeaseReady = activateControlLease()
         ensureForeground()
+        if (!controlLeaseReady) {
+            // Running without a LAN observer could leave controls connected
+            // after the phone leaves home. Abort the lease fail-closed.
+            stopRemote("network_callback_unavailable")
+            return START_NOT_STICKY
+        }
         when (intent?.action) {
             ACTION_START -> {
                 // Opening controls while already locked must not silently create
                 // a fresh network session. A lease armed while unlocked may later
                 // reconnect passively while locked when the home LAN returns.
-                if (!keyguard.isKeyguardLocked) {
+                val canArmWhileUnlocked = !keyguard.isKeyguardLocked
+                if (canArmWhileUnlocked) {
                     networkReconnectArmed = true
-                    scheduleHomeNetworkRevalidation(
-                        "explicit_start",
-                        immediate = true,
-                        rearm = true,
-                    )
                 }
+                // A fresh locked start must still enter the bounded away
+                // lifecycle when there is no home LAN; it just may not
+                // create a new TV connection while locked.
+                scheduleHomeNetworkRevalidation(
+                    "explicit_start",
+                    immediate = true,
+                    rearm = canArmWhileUnlocked,
+                )
             }
             null -> {
                 // START_STICKY is used only for an already-running foreground
                 // control lease. Process death invalidates every old PendingIntent;
                 // this fresh lease gets a fresh capability and notification.
                 networkReconnectArmed = true
+                persistedAwayRemainingMs()?.let { remainingMs ->
+                    if (remainingMs <= 0L) {
+                        stopRemote("away_timeout_restored")
+                        return START_NOT_STICKY
+                    }
+                    val restoredDeadline = SystemClock.elapsedRealtime() +
+                        remainingMs.coerceAtMost(HOME_NETWORK_WATCHER_TIMEOUT_MS)
+                    hybridHomeNetworkPolicy.restoreAwayWatching(restoredDeadline)
+                    scheduleAwayStop(restoredDeadline)
+                    Diagnostics.record(
+                        this,
+                        "home_network",
+                        "away_watcher_restored",
+                        "remaining_ms" to remainingMs,
+                    )
+                }
                 scheduleHomeNetworkRevalidation(
                     "sticky_restart",
                     immediate = true,
@@ -269,15 +318,27 @@ class RemoteControlService : Service() {
         networkRevalidationJob = null
         reconnectRetryJob?.cancel()
         reconnectRetryJob = null
+        departureGraceJob?.cancel()
+        departureGraceJob = null
+        awayStopJob?.cancel()
+        awayStopJob = null
+        nowPlayingRefreshJob?.cancel()
+        nowPlayingRefreshJob = null
+        mediaSessionRetryJob?.cancel()
+        mediaSessionRetryJob = null
         reconnectBackoff.reset()
         unregisterNetworkCallback()
         homeAuthorization = null
         networkReconnectArmed = false
         homeNetworkPolicy.reset()
+        hybridHomeNetworkPolicy.reset()
+        networkCallbackGate.reset()
         artworkJob?.cancel()
         artworkJob = null
         artworkBitmap = null
         loadedArtworkId = null
+        mediaSessionCreationFailed = false
+        mediaSessionCreationFailures = 0
         releaseMediaSession()
         Diagnostics.updateRuntimeState(
             serviceRunning = false,
@@ -450,35 +511,51 @@ class RemoteControlService : Service() {
     private fun isServiceNetworkAuthorized(leaseToken: String): Boolean =
         isControlLeaseActive(leaseToken) && homeAuthorization?.isStillValid() == true
 
-    private fun registerNetworkCallback() {
-        if (networkCallback != null) return
+    private fun registerNetworkCallback(): Boolean {
+        if (networkCallback != null) return true
         val callback = object : ConnectivityManager.NetworkCallback() {
             override fun onAvailable(network: Network) {
-                scope.launch { scheduleHomeNetworkRevalidation("available", rearm = true) }
+                scope.launch {
+                    handleLanCallback(
+                        networkCallbackGate.onAvailable(network.networkHandle),
+                        "available",
+                    )
+                }
             }
 
             override fun onCapabilitiesChanged(
                 network: Network,
                 networkCapabilities: NetworkCapabilities,
             ) {
-                scope.launch { scheduleHomeNetworkRevalidation("capabilities", rearm = true) }
+                scope.launch {
+                    handleLanCallback(
+                        networkCallbackGate.onCapabilitiesChanged(
+                            network.networkHandle,
+                            networkCapabilities.toLanCapsKey(),
+                        ),
+                        "capabilities",
+                    )
+                }
             }
 
             override fun onLinkPropertiesChanged(network: Network, linkProperties: LinkProperties) {
-                scope.launch { scheduleHomeNetworkRevalidation("link_properties", rearm = true) }
+                scope.launch {
+                    handleLanCallback(
+                        networkCallbackGate.onLinkPropertiesChanged(
+                            network.networkHandle,
+                            linkProperties.toLanLinkKey(),
+                        ),
+                        "link_properties",
+                    )
+                }
             }
 
             override fun onLost(network: Network) {
                 scope.launch {
-                    if (homeAuthorization?.isFor(network) == true) {
-                        leaveHomeNetwork("lost")
-                    } else {
-                        scheduleHomeNetworkRevalidation(
-                            "lost",
-                            immediate = true,
-                            rearm = true,
-                        )
-                    }
+                    handleLanCallback(
+                        networkCallbackGate.onLost(network.networkHandle),
+                        "lost",
+                    )
                 }
             }
         }
@@ -491,6 +568,7 @@ class RemoteControlService : Service() {
             connectivityManager.registerNetworkCallback(request, callback)
             networkCallback = callback
             Diagnostics.record(this, "home_network", "callback_registered")
+            return true
         } catch (error: RuntimeException) {
             Diagnostics.exception(this, "home_network", "callback_register", error)
             // Fail closed if Android refuses network observation.
@@ -498,7 +576,19 @@ class RemoteControlService : Service() {
             homeAuthorization = null
             connectJob?.cancel()
             connectJob = null
+            reconcileMediaPresentation(lastSnapshot)
+            updateArtwork(null)
+            refreshNotification()
             scope.launch { session.disconnect(force = true) }
+            return false
+        }
+    }
+
+    private fun handleLanCallback(action: LanCallbackAction, trigger: String) {
+        when (action) {
+            LanCallbackAction.Ignore -> Unit
+            LanCallbackAction.Revalidate -> scheduleHomeNetworkRevalidation(trigger)
+            LanCallbackAction.AuthorizedLoss -> suspectHomeNetworkDeparture(trigger)
         }
     }
 
@@ -512,7 +602,7 @@ class RemoteControlService : Service() {
         Diagnostics.record(this, "home_network", "callback_unregistered")
     }
 
-    /** Collapse callback bursts; onLost for the authorized Network bypasses the delay. */
+    /** Collapse callback bursts without resetting the finite TV reconnect budget. */
     private fun scheduleHomeNetworkRevalidation(
         trigger: String,
         immediate: Boolean = false,
@@ -524,19 +614,100 @@ class RemoteControlService : Service() {
             reconnectBackoff.reset()
             homeNetworkPolicy.reset()
         }
+        val generation = ++networkRevalidationGeneration
         networkRevalidationJob?.cancel()
         networkRevalidationJob = scope.launch {
             if (!immediate) delay(NETWORK_CALLBACK_DEBOUNCE_MS)
-            reconcileHomeNetwork(trigger)
+            reconcileHomeNetwork(trigger, generation)
         }
     }
 
-    private suspend fun reconcileHomeNetwork(trigger: String) {
+    private suspend fun reconcileHomeNetwork(trigger: String, generation: Long) {
         val leaseToken = capabilityToken
         if (!isControlLeaseActive(leaseToken)) return
+        val previousAuthorization = homeAuthorization
         val authorization = homeNetworks.automaticAuthorization()
             ?.takeIf { it.isStillValid() }
+        if (generation != networkRevalidationGeneration || !isControlLeaseActive(leaseToken)) {
+            Diagnostics.record(
+                this,
+                "home_network",
+                "revalidation_stale",
+                "trigger" to DiagnosticToken(trigger),
+            )
+            return
+        }
+        if (authorization == null && departureGraceJob?.isActive == true) {
+            Diagnostics.record(
+                this,
+                "home_network",
+                "departure_unconfirmed",
+                "trigger" to DiagnosticToken(trigger),
+            )
+            return
+        }
+        if (authorization != null) {
+            clearPersistedAwayDeadline()
+            val networkCommit = networkCallbackGate.commitAuthorization(
+                authorization.network.networkHandle,
+            )
+            val transition = hybridHomeNetworkPolicy.observe(
+                authorized = true,
+                nowMs = SystemClock.elapsedRealtime(),
+            )
+            cancelAwayTimers("home_authorized")
+            if (transition.edgeAction == HybridHomeNetworkEdgeAction.ReturnedHome) {
+                Diagnostics.record(this, "home_network", "returned_home")
+                reconnectRetryJob?.cancel()
+                reconnectRetryJob = null
+                reconnectBackoff.reset()
+                // The socket can die during the two-second grace. Treat a
+                // confirmed return as a real authorization edge so a stale
+                // `previous=true` cannot suppress the one required reconnect.
+                homeNetworkPolicy.reset()
+            }
+            if (networkCommit == LanAuthorizationCommit.Handover) {
+                connectJob?.cancel()
+                connectJob = null
+                reconnectRetryJob?.cancel()
+                reconnectRetryJob = null
+                nowPlayingRefreshJob?.cancel()
+                nowPlayingRefreshJob = null
+                reconnectBackoff.reset()
+                homeNetworkPolicy.reset()
+                session.disconnect(force = true)
+                if (
+                    generation != networkRevalidationGeneration ||
+                    !isControlLeaseActive(leaseToken) ||
+                    !authorization.isStillValid()
+                ) {
+                    Diagnostics.record(
+                        this,
+                        "home_network",
+                        "handover_stale_after_disconnect",
+                    )
+                    networkRevalidationJob = null
+                    suspectHomeNetworkDeparture("handover_stale")
+                    return
+                }
+                Diagnostics.record(this, "home_network", "handover")
+            }
+        }
         homeAuthorization = authorization
+        reconcileMediaPresentation(lastSnapshot)
+        updateArtwork(lastSnapshot.nowPlaying.artwork.takeIf { shouldPresentMedia(lastSnapshot) })
+        updateMediaSession(lastSnapshot)
+        refreshNotification()
+        if (
+            authorization != null &&
+            previousAuthorization == null &&
+            session.connectionState.value == ConnectionState.Connected
+        ) {
+            // The foreground service can attach to a Companion session that
+            // was already connected by the activity. Its Connected edge was
+            // observed before LAN authorization existed, so refresh once now.
+            scheduleNowPlayingRefresh()
+        }
         val action = homeNetworkPolicy.evaluate(
             leaseActive = isControlLeaseActive(leaseToken),
             reconnectArmed = networkReconnectArmed,
@@ -557,28 +728,22 @@ class RemoteControlService : Service() {
             HomeNetworkServiceAction.Disconnect -> {
                 // Avoid cancelling the coroutine that is performing this departure.
                 networkRevalidationJob = null
-                leaveHomeNetwork("revalidation")
+                suspectHomeNetworkDeparture("revalidation")
             }
             HomeNetworkServiceAction.Reconnect -> {
-                val validAuthorization = authorization ?: return
-                connectJob?.cancel()
-                connectJob = scope.launch {
-                    session.connectLastPaired(
-                        // This is state synchronization owned by an already-active
-                        // foreground lease; input commands retain their lock policy.
-                        requireUnlocked = false,
-                        authorizationStillValid = {
-                            networkReconnectArmed &&
-                                isControlLeaseActive(leaseToken) &&
-                                validAuthorization.isStillValid()
-                        },
-                    )
-                }
+                if (authorization != null) attemptAuthorizedConnect("network_edge")
             }
         }
     }
 
-    private suspend fun leaveHomeNetwork(reason: String) {
+    private fun suspectHomeNetworkDeparture(reason: String) {
+        if (departureGraceJob?.isActive == true || awayStopJob?.isActive == true) return
+        val transition = hybridHomeNetworkPolicy.observe(
+            authorized = false,
+            nowMs = SystemClock.elapsedRealtime(),
+        )
+        val deadline = transition.nextEvaluationAtMs ?: return
+        networkRevalidationGeneration += 1L
         networkRevalidationJob?.cancel()
         networkRevalidationJob = null
         homeAuthorization = null
@@ -586,7 +751,52 @@ class RemoteControlService : Service() {
         connectJob = null
         reconnectRetryJob?.cancel()
         reconnectRetryJob = null
+        nowPlayingRefreshJob?.cancel()
+        nowPlayingRefreshJob = null
+        reconcileMediaPresentation(lastSnapshot)
+        updateArtwork(null)
+        refreshNotification()
+        Diagnostics.record(
+            this,
+            "home_network",
+            "departure_suspected",
+            "reason" to DiagnosticToken(reason),
+            "grace_ms" to HOME_NETWORK_DEPARTURE_GRACE_MS,
+        )
+        departureGraceJob = scope.launch {
+            delay((deadline - SystemClock.elapsedRealtime()).coerceAtLeast(0L))
+            departureGraceJob = null
+            val authorization = homeNetworks.automaticAuthorization()
+                ?.takeIf { it.isStillValid() }
+            if (authorization != null) {
+                Diagnostics.record(this@RemoteControlService, "home_network", "departure_cancelled")
+                scheduleHomeNetworkRevalidation("departure_grace_recovered", immediate = true)
+            } else {
+                val deadlineTransition = hybridHomeNetworkPolicy.onDeadline(
+                    SystemClock.elapsedRealtime(),
+                )
+                if (deadlineTransition.edgeAction == HybridHomeNetworkEdgeAction.DepartureConfirmed) {
+                    confirmHomeNetworkDeparture(reason, deadlineTransition.nextEvaluationAtMs)
+                }
+            }
+        }
+    }
+
+    private suspend fun confirmHomeNetworkDeparture(reason: String, stopDeadlineMs: Long?) {
+        val departureGeneration = networkRevalidationGeneration
+        departureGraceJob?.cancel()
+        departureGraceJob = null
+        networkRevalidationJob?.cancel()
+        networkRevalidationJob = null
+        homeAuthorization = null
+        connectJob?.cancel()
+        connectJob = null
+        reconnectRetryJob?.cancel()
+        reconnectRetryJob = null
+        nowPlayingRefreshJob?.cancel()
+        nowPlayingRefreshJob = null
         reconnectBackoff.reset()
+        networkCallbackGate.clearAuthorization()
         homeNetworkPolicy.evaluate(
             leaseActive = isControlLeaseActive(capabilityToken),
             reconnectArmed = networkReconnectArmed,
@@ -600,10 +810,93 @@ class RemoteControlService : Service() {
             "departed",
             "reason" to DiagnosticToken(reason),
         )
+        // Install the bounded watcher before the suspending disconnect. A
+        // concurrent home return can then cancel it instead of letting this
+        // old confirmation install a stale timer after recovery.
+        persistAwayDeadline(stopDeadlineMs)
+        scheduleAwayStop(stopDeadlineMs)
         session.disconnect(force = true)
-        // A handover can deliver onLost before onAvailable. Recheck once after
-        // the burst so an equivalent home Network can establish a fresh lease.
-        scheduleHomeNetworkRevalidation("post_departure")
+        if (
+            departureGeneration != networkRevalidationGeneration ||
+            homeAuthorization != null
+        ) {
+            Diagnostics.record(this, "home_network", "departure_interrupted")
+            homeNetworkPolicy.reset()
+            scheduleHomeNetworkRevalidation(
+                "departure_disconnect_recovered",
+                immediate = true,
+            )
+            return
+        }
+        reconcileMediaPresentation(lastSnapshot)
+        updateArtwork(null)
+        refreshNotification()
+    }
+
+    private fun scheduleAwayStop(stopDeadlineMs: Long?) {
+        if (awayStopJob?.isActive == true) return
+        val deadline = stopDeadlineMs ?: return
+        Diagnostics.record(
+            this,
+            "home_network",
+            "away_stop_scheduled",
+            "delay_ms" to (deadline - SystemClock.elapsedRealtime()).coerceAtLeast(0L),
+        )
+        awayStopJob = scope.launch {
+            delay((deadline - SystemClock.elapsedRealtime()).coerceAtLeast(0L))
+            awayStopJob = null
+            val authorization = homeNetworks.automaticAuthorization()
+                ?.takeIf { it.isStillValid() }
+            if (authorization != null) {
+                Diagnostics.record(this@RemoteControlService, "home_network", "away_stop_cancelled")
+                scheduleHomeNetworkRevalidation("away_timeout_recovered", immediate = true)
+            } else {
+                val deadlineTransition = hybridHomeNetworkPolicy.onDeadline(
+                    SystemClock.elapsedRealtime(),
+                )
+                if (deadlineTransition.edgeAction == HybridHomeNetworkEdgeAction.StopService) {
+                    stopRemote("away_timeout")
+                }
+            }
+        }
+    }
+
+    private fun cancelAwayTimers(reason: String) {
+        val departureCancelled = departureGraceJob?.isActive == true
+        val stopCancelled = awayStopJob?.isActive == true
+        departureGraceJob?.cancel()
+        departureGraceJob = null
+        awayStopJob?.cancel()
+        awayStopJob = null
+        if (departureCancelled || stopCancelled) {
+            Diagnostics.record(
+                this,
+                "home_network",
+                "away_timers_cancelled",
+                "reason" to DiagnosticToken(reason),
+            )
+        }
+    }
+
+    private fun persistAwayDeadline(stopDeadlineElapsedMs: Long?) {
+        val deadline = stopDeadlineElapsedMs ?: return
+        val remainingMs = (deadline - SystemClock.elapsedRealtime())
+            .coerceIn(0L, HOME_NETWORK_WATCHER_TIMEOUT_MS)
+        lifecyclePreferences.edit()
+            .putLong(PREF_AWAY_DEADLINE_EPOCH_MS, System.currentTimeMillis() + remainingMs)
+            .apply()
+    }
+
+    private fun persistedAwayRemainingMs(): Long? {
+        val deadlineEpochMs = lifecyclePreferences.getLong(PREF_AWAY_DEADLINE_EPOCH_MS, 0L)
+            .takeIf { it > 0L }
+            ?: return null
+        return deadlineEpochMs - System.currentTimeMillis()
+    }
+
+    private fun clearPersistedAwayDeadline() {
+        if (!lifecyclePreferences.contains(PREF_AWAY_DEADLINE_EPOCH_MS)) return
+        lifecyclePreferences.edit().remove(PREF_AWAY_DEADLINE_EPOCH_MS).apply()
     }
 
     private fun handleConnectionLifecycle(state: ConnectionState) {
@@ -614,6 +907,7 @@ class RemoteControlService : Service() {
                 reconnectRetryJob?.cancel()
                 reconnectRetryJob = null
                 reconnectBackoff.reset()
+                if (previous != ConnectionState.Connected) scheduleNowPlayingRefresh()
             }
             ConnectionState.Connecting -> {
                 // A real attempt is already in progress; do not let an older
@@ -629,20 +923,69 @@ class RemoteControlService : Service() {
 
     private fun scheduleBoundedReconnect() {
         if (!networkReconnectArmed || !acceptingCommands) return
-        if (homeAuthorization?.isStillValid() != true) return
+        val authorization = homeAuthorization?.takeIf { it.isStillValid() } ?: return
         if (reconnectRetryJob?.isActive == true) return
         val delayMs = reconnectBackoff.nextDelayMs() ?: run {
             Diagnostics.record(this, "home_network", "retry_budget_exhausted")
             return
         }
         val leaseToken = capabilityToken
+        val networkHandle = authorization.network.networkHandle
         Diagnostics.record(this, "home_network", "retry_scheduled", "delay_ms" to delayMs)
         reconnectRetryJob = scope.launch {
             delay(delayMs)
             reconnectRetryJob = null
             if (!isServiceNetworkAuthorized(leaseToken)) return@launch
-            homeNetworkPolicy.reset()
-            scheduleHomeNetworkRevalidation("connection_retry", immediate = true)
+            if (homeAuthorization?.network?.networkHandle != networkHandle) return@launch
+            attemptAuthorizedConnect("retry")
+        }
+    }
+
+    private fun attemptAuthorizedConnect(cause: String) {
+        if (!networkReconnectArmed || !acceptingCommands || connectJob?.isActive == true) return
+        val authorization = homeAuthorization?.takeIf { it.isStillValid() } ?: return
+        val leaseToken = capabilityToken
+        val networkHandle = authorization.network.networkHandle
+        Diagnostics.record(
+            this,
+            "home_network",
+            "connect_attempt",
+            "cause" to DiagnosticToken(cause),
+        )
+        connectJob = scope.launch {
+            session.connectLastPaired(
+                requireUnlocked = false,
+                authorizationStillValid = {
+                    networkReconnectArmed &&
+                        isControlLeaseActive(leaseToken) &&
+                        homeAuthorization?.network?.networkHandle == networkHandle &&
+                        authorization.isStillValid()
+                },
+            )
+        }
+    }
+
+    /** Connect already sends the t=0 request; these are the two bounded follow-ups. */
+    private fun scheduleNowPlayingRefresh() {
+        nowPlayingRefreshJob?.cancel()
+        val leaseToken = capabilityToken
+        val networkHandle = homeAuthorization?.network?.networkHandle ?: return
+        nowPlayingRefreshJob = scope.launch {
+            var previousDelayMs = 0L
+            for (targetDelayMs in NOW_PLAYING_REFRESH_DELAYS_MS) {
+                delay(targetDelayMs - previousDelayMs)
+                previousDelayMs = targetDelayMs
+                if (
+                    !isControlLeaseActive(leaseToken) ||
+                    homeAuthorization?.network?.networkHandle != networkHandle ||
+                    session.connectionState.value != ConnectionState.Connected
+                ) {
+                    return@launch
+                }
+                if (!session.nowPlaying.value.needsBoundedRefresh()) return@launch
+                session.refreshNowPlaying()
+            }
+            nowPlayingRefreshJob = null
         }
     }
 
@@ -722,6 +1065,54 @@ class RemoteControlService : Service() {
             "has_metadata" to (nowPlaying.title != null),
             "has_artwork" to (artworkBitmap != null),
         )
+    }
+
+    private fun shouldPresentMedia(snapshot: NotificationSnapshot): Boolean =
+        homeAuthorization != null &&
+            snapshot.state == ConnectionState.Connected &&
+            snapshot.nowPlaying.hasMediaSignal()
+
+    private fun reconcileMediaPresentation(snapshot: NotificationSnapshot) {
+        if (!shouldPresentMedia(snapshot)) {
+            mediaSessionRetryJob?.cancel()
+            mediaSessionRetryJob = null
+            mediaSessionCreationFailed = false
+            mediaSessionCreationFailures = 0
+            if (mediaSession != null) releaseMediaSession()
+            return
+        }
+        if (mediaSession != null || mediaSessionCreationFailed) return
+        Diagnostics.record(this, "media_session", "creating")
+        mediaSession = try {
+            createMediaSession(capabilityToken).also {
+                mediaSessionCreationFailed = false
+                mediaSessionCreationFailures = 0
+            }
+        } catch (error: RuntimeException) {
+            Diagnostics.exception(this, "media_session", "create", error)
+            mediaSessionCreationFailed = true
+            mediaSessionCreationFailures += 1
+            scheduleMediaSessionCreationRetry()
+            null
+        }
+    }
+
+    private fun scheduleMediaSessionCreationRetry() {
+        if (
+            mediaSessionCreationFailures > MAX_MEDIA_SESSION_CREATE_RETRIES ||
+            mediaSessionRetryJob?.isActive == true
+        ) {
+            return
+        }
+        mediaSessionRetryJob = scope.launch {
+            delay(MEDIA_SESSION_CREATE_RETRY_MS)
+            mediaSessionRetryJob = null
+            if (!shouldPresentMedia(lastSnapshot)) return@launch
+            mediaSessionCreationFailed = false
+            reconcileMediaPresentation(lastSnapshot)
+            updateMediaSession(lastSnapshot)
+            refreshNotification()
+        }
     }
 
     /** Decode/fetch artwork once per media item; state pushes never poll the TV. */
@@ -818,26 +1209,11 @@ class RemoteControlService : Service() {
             Diagnostics.record(this, "notification", "foreground_already_started")
             return
         }
-        val currentSession = mediaSession ?: run {
-            Diagnostics.record(
-                this,
-                "notification",
-                "foreground_skipped",
-                "reason" to DiagnosticToken("no_media_session"),
-            )
-            return
-        }
         Diagnostics.record(this, "notification", "foreground_start_attempt")
         try {
             startForeground(
                 NOTIFICATION_ID,
-                RemoteNotification.build(
-                    this,
-                    lastSnapshot,
-                    currentSession.sessionToken,
-                    artworkBitmap,
-                    capabilityToken,
-                ),
+                buildForegroundNotification(),
             )
             foregroundStarted = true
             Diagnostics.updateRuntimeState(foregroundStarted = true)
@@ -850,22 +1226,35 @@ class RemoteControlService : Service() {
 
     private fun refreshNotification() {
         if (!foregroundStarted) return
-        val currentSession = mediaSession ?: return
         try {
             getSystemService(NotificationManager::class.java).notify(
                 NOTIFICATION_ID,
-                RemoteNotification.build(
-                    this,
-                    lastSnapshot,
-                    currentSession.sessionToken,
-                    artworkBitmap,
-                    capabilityToken,
-                ),
+                buildForegroundNotification(),
             )
             Diagnostics.record(this, "notification", "refreshed", "id" to NOTIFICATION_ID)
         } catch (error: RuntimeException) {
             Diagnostics.exception(this, "notification", "refresh", error)
             throw error
+        }
+    }
+
+    private fun buildForegroundNotification(): Notification {
+        val currentSession = mediaSession
+        return if (currentSession != null && shouldPresentMedia(lastSnapshot)) {
+            RemoteNotification.buildMedia(
+                this,
+                lastSnapshot,
+                currentSession.sessionToken,
+                artworkBitmap,
+                capabilityToken,
+            )
+        } else {
+            RemoteNotification.buildService(
+                this,
+                lastSnapshot.state,
+                waitingForHomeNetwork = homeAuthorization == null,
+                capabilityToken = capabilityToken,
+            )
         }
     }
 
@@ -879,15 +1268,28 @@ class RemoteControlService : Service() {
         networkRevalidationJob = null
         reconnectRetryJob?.cancel()
         reconnectRetryJob = null
+        departureGraceJob?.cancel()
+        departureGraceJob = null
+        awayStopJob?.cancel()
+        awayStopJob = null
+        nowPlayingRefreshJob?.cancel()
+        nowPlayingRefreshJob = null
+        mediaSessionRetryJob?.cancel()
+        mediaSessionRetryJob = null
         reconnectBackoff.reset()
         unregisterNetworkCallback()
         homeAuthorization = null
         networkReconnectArmed = false
         homeNetworkPolicy.reset()
+        hybridHomeNetworkPolicy.reset()
+        networkCallbackGate.reset()
+        clearPersistedAwayDeadline()
         artworkJob?.cancel()
         artworkJob = null
         artworkBitmap = null
         loadedArtworkId = null
+        mediaSessionCreationFailed = false
+        mediaSessionCreationFailures = 0
         releaseMediaSession()
         revokeCapabilities()
         foregroundStarted = false
@@ -897,27 +1299,25 @@ class RemoteControlService : Service() {
         stopSelf()
     }
 
-    private fun activateControlLease() {
+    private fun activateControlLease(): Boolean {
         if (acceptingCommands) {
             Diagnostics.record(this, "remote_service", "lease_already_active")
-            return
+            return networkCallback != null
         }
         acceptingCommands = true
+        mediaSessionCreationFailed = false
+        mediaSessionCreationFailures = 0
         RemoteControlLeaseRegistry.activate(capabilityToken)
         session.setQuickRemoteOwner(true)
-        registerNetworkCallback()
-        Diagnostics.record(this, "media_session", "creating")
-        mediaSession = try {
-            createMediaSession(capabilityToken)
-        } catch (error: RuntimeException) {
-            Diagnostics.exception(this, "media_session", "create", error)
-            acceptingCommands = false
-            revokeCapabilities()
-            session.setQuickRemoteOwner(false)
-            throw error
+        val observationReady = registerNetworkCallback()
+        if (!observationReady) {
+            Diagnostics.record(this, "remote_service", "lease_activation_failed")
+            return false
         }
         Diagnostics.record(this, "remote_service", "lease_activated")
+        reconcileMediaPresentation(lastSnapshot)
         updateMediaSession(lastSnapshot)
+        return true
     }
 
     private fun revokeCapabilities() {
@@ -943,6 +1343,11 @@ class RemoteControlService : Service() {
         private const val MAX_ARTWORK_BYTES = 3L * 1024 * 1024
         private const val DEFAULT_ARTWORK_BUFFER_BYTES = 32 * 1024
         private const val NETWORK_CALLBACK_DEBOUNCE_MS = 350L
+        private const val MEDIA_SESSION_CREATE_RETRY_MS = 1_500L
+        private const val MAX_MEDIA_SESSION_CREATE_RETRIES = 1
+        private const val LIFECYCLE_PREFERENCES = "remote_service_lifecycle"
+        private const val PREF_AWAY_DEADLINE_EPOCH_MS = "away_deadline_epoch_ms"
+        private val NOW_PLAYING_REFRESH_DELAYS_MS = longArrayOf(1_500L, 5_000L)
 
         fun start(context: Context, expectedCapability: String? = null) {
             Diagnostics.record(
@@ -966,6 +1371,10 @@ class RemoteControlService : Service() {
         fun stop(context: Context) {
             Diagnostics.record(context, "service_api", "stop_requested")
             Diagnostics.updateRuntimeState(lastStopReason = DiagnosticToken("api_stop"))
+            context.getSharedPreferences(LIFECYCLE_PREFERENCES, Context.MODE_PRIVATE)
+                .edit()
+                .remove(PREF_AWAY_DEADLINE_EPOCH_MS)
+                .apply()
             context.stopService(Intent(context, RemoteControlService::class.java))
         }
 
@@ -1015,6 +1424,65 @@ private fun NowPlayingSnapshot.subtitle(): String? {
         ?: appName
 }
 
+private fun NowPlayingSnapshot.hasMediaSignal(): Boolean =
+    isAuthoritative &&
+        (
+            status != PlaybackStatus.Unknown ||
+                title != null ||
+                artist != null ||
+                seriesName != null ||
+                contentId != null ||
+                artwork != null ||
+                durationMs != null
+            )
+
+private fun NowPlayingSnapshot.needsBoundedRefresh(): Boolean =
+    !isAuthoritative ||
+        status == PlaybackStatus.Unknown ||
+        (
+            title == null &&
+                artist == null &&
+                seriesName == null &&
+                contentId == null &&
+                artwork == null &&
+                durationMs == null
+            )
+
+private fun NetworkCapabilities.toLanCapsKey(): LanCapsKey = LanCapsKey(
+    notVpn = hasCapability(NetworkCapabilities.NET_CAPABILITY_NOT_VPN),
+    wifi = hasTransport(NetworkCapabilities.TRANSPORT_WIFI),
+    ethernet = hasTransport(NetworkCapabilities.TRANSPORT_ETHERNET),
+)
+
+private fun LinkProperties.toLanLinkKey(): LanLinkKey = LanLinkKey(
+    prefixes = linkAddresses.mapNotNullTo(mutableSetOf()) { link ->
+        val address = link.address
+        if (!address.isUsableLanAddress()) return@mapNotNullTo null
+        LocalNetworkIdentity.addressToken(
+            LocalNetworkIdentity.maskPrefix(address.address, link.prefixLength),
+            link.prefixLength,
+        )
+    },
+    defaultGateways = routes.mapNotNullTo(mutableSetOf()) { route ->
+        if (!route.isDefaultRoute) return@mapNotNullTo null
+        route.gateway
+            ?.takeIf { it.isUsableLanAddress() }
+            ?.let { LocalNetworkIdentity.addressToken(it.address, null) }
+    },
+    dnsServers = dnsServers.mapNotNullTo(mutableSetOf()) { address ->
+        address
+            .takeIf { it.isUsableLanAddress() }
+            ?.let { LocalNetworkIdentity.addressToken(it.address, null) }
+    },
+)
+
+private fun InetAddress.isUsableLanAddress(): Boolean =
+    (this is Inet4Address || this is Inet6Address) &&
+        !isAnyLocalAddress &&
+        !isLoopbackAddress &&
+        !isMulticastAddress &&
+        !isLinkLocalAddress
+
 private data class NotificationSnapshot(
     val state: ConnectionState,
     val deviceName: String?,
@@ -1027,9 +1495,11 @@ private object RemoteNotification {
     // Channel visibility is immutable, so this intentionally differs from the
     // old SECRET custom-notification channel.
     private const val CHANNEL_ID = "apple_tv_native_media_controls"
+    private const val SERVICE_CHANNEL_ID = "apple_tv_home_network_watcher"
 
     fun createChannel(context: Context) {
-        context.getSystemService(NotificationManager::class.java).createNotificationChannel(
+        val manager = context.getSystemService(NotificationManager::class.java)
+        manager.createNotificationChannel(
             NotificationChannel(
                 CHANNEL_ID,
                 "Apple TV controls",
@@ -1042,6 +1512,19 @@ private object RemoteNotification {
                 lockscreenVisibility = Notification.VISIBILITY_PUBLIC
             },
         )
+        manager.createNotificationChannel(
+            NotificationChannel(
+                SERVICE_CHANNEL_ID,
+                "Apple TV background connection",
+                NotificationManager.IMPORTANCE_LOW,
+            ).apply {
+                description = "Briefly watches for the saved home network after it disconnects"
+                setSound(null, null)
+                enableVibration(false)
+                setShowBadge(false)
+                lockscreenVisibility = Notification.VISIBILITY_SECRET
+            },
+        )
         Diagnostics.record(context, "notification", "channel_ensured")
     }
 
@@ -1052,7 +1535,7 @@ private object RemoteNotification {
         return channel == null || channel.importance != NotificationManager.IMPORTANCE_NONE
     }
 
-    fun build(
+    fun buildMedia(
         context: Context,
         snapshot: NotificationSnapshot,
         token: MediaSession.Token,
@@ -1136,6 +1619,37 @@ private object RemoteNotification {
 
         artwork?.let { builder.setLargeIcon(it) }
 
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+            builder.setForegroundServiceBehavior(Notification.FOREGROUND_SERVICE_IMMEDIATE)
+        }
+        return builder.build()
+    }
+
+    /** Foreground-service disclosure only: no MediaStyle, token or remote buttons. */
+    fun buildService(
+        context: Context,
+        state: ConnectionState,
+        waitingForHomeNetwork: Boolean,
+        capabilityToken: String,
+    ): Notification {
+        val status = when {
+            waitingForHomeNetwork -> "Waiting for home network"
+            state == ConnectionState.Connecting -> "Connecting to Apple TV"
+            state == ConnectionState.Connected -> "Apple TV connected"
+            else -> "Ready to connect"
+        }
+        val builder = Notification.Builder(context, SERVICE_CHANNEL_ID)
+            .setSmallIcon(R.drawable.ic_qs_remote)
+            .setContentTitle("CyberRemote")
+            .setContentText(status)
+            .setContentIntent(remoteIntent(context, 991, capabilityToken))
+            .setCategory(Notification.CATEGORY_SERVICE)
+            .setVisibility(Notification.VISIBILITY_SECRET)
+            .setOngoing(true)
+            .setOnlyAlertOnce(true)
+            .setShowWhen(false)
+            .setLocalOnly(true)
+            .setSilent(true)
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
             builder.setForegroundServiceBehavior(Notification.FOREGROUND_SERVICE_IMMEDIATE)
         }

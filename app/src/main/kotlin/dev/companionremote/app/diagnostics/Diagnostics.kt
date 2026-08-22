@@ -39,6 +39,7 @@ object Diagnostics {
     private const val MAX_FILE_BYTES = 48L * 1024L
     private const val MAX_REPORT_CHARS = 110_000
     private const val MEDIA_CHANNEL_ID = "apple_tv_native_media_controls"
+    private const val WATCHER_CHANNEL_ID = "apple_tv_home_network_watcher"
     private const val MEDIA_NOTIFICATION_ID = 4207
     private const val MAX_PENDING_WRITES = 128
     private const val FLUSH_TIMEOUT_MS = 1_500L
@@ -171,6 +172,7 @@ object Diagnostics {
             appendLine("Microphone permission: ${microphonePermission(appContext)}")
             appendLine("App notifications: ${appNotificationState(appContext)}")
             appendLine("Media channel: ${mediaChannelState(appContext)}")
+            appendLine("Watcher channel: ${watcherChannelState(appContext)}")
             appendLine("Media notification active: ${mediaNotificationState(appContext)}")
             appendLine("Keyguard: ${keyguardState(appContext)}")
             appendLine("Battery optimization: ${batteryOptimizationState(appContext)}")
@@ -356,6 +358,15 @@ object Diagnostics {
             ?: return@runCatching "missing"
         val enabled = channel.importance != NotificationManager.IMPORTANCE_NONE
         "${if (enabled) "enabled" else "blocked"}; importance=${channel.importance}; lockscreen_visibility=${channel.lockscreenVisibility}"
+    }.getOrDefault("unavailable")
+
+    private fun watcherChannelState(context: Context): String = runCatching {
+        val channel = context.getSystemService(NotificationManager::class.java)
+            .getNotificationChannel(WATCHER_CHANNEL_ID)
+            ?: return@runCatching "missing"
+        val enabled = channel.importance != NotificationManager.IMPORTANCE_NONE
+        "${if (enabled) "enabled" else "blocked"}; importance=${channel.importance}; " +
+            "lockscreen_visibility=${channel.lockscreenVisibility}"
     }.getOrDefault("unavailable")
 
     private fun mediaNotificationState(context: Context): String = runCatching {

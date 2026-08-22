@@ -1,6 +1,7 @@
 package dev.companionremote.protocol.client
 
 import dev.companionremote.protocol.companion.CompanionConnection
+import dev.companionremote.protocol.companion.MessageType
 import dev.companionremote.protocol.hap.FakeAtv
 import dev.companionremote.protocol.hap.FakeAtvTransport
 import dev.companionremote.protocol.hap.HapCredentials
@@ -134,6 +135,23 @@ class CompanionClientTest {
     }) { client, _ ->
         assertNull(client.fetchAttentionState())
     }
+
+    @Test
+    fun `now playing refresh sends exactly one fire-and-forget fetch event`() =
+        runWithClient({ null }) { client, atv ->
+            atv.eventLog.clear()
+
+            client.refreshNowPlaying()
+
+            val refreshes = atv.eventLog.filter {
+                it["_i"] == "FetchCurrentNowPlayingInfoEvent"
+            }
+            assertEquals(1, refreshes.size)
+            assertEquals(MessageType.EVENT, refreshes.single()["_t"])
+            @Suppress("UNCHECKED_CAST")
+            val content = refreshes.single()["_c"] as Map<Any?, Any?>
+            assertTrue(content.isEmpty())
+        }
 
     @Test
     fun `touch tap emits select press and click event`() = runWithClient({ null }) { client, atv ->

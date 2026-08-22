@@ -30,14 +30,14 @@ internal class HomeNetworkRepository(context: Context) {
 
     suspend fun automaticAuthorization(): HomeNetworkAuthorization? {
         val binding = settingsRepository.homeNetworkBinding() ?: return null
-        val current = identity.current() ?: return null
+        val current = identity.matching(binding.networkFingerprint) ?: return null
         if (!HomeNetworkPolicy.allowsAutomaticAccess(binding, current.fingerprint)) return null
         return HomeNetworkAuthorization(binding, current.network, identity)
     }
 
     suspend fun automaticAuthorization(deviceIdentifier: ByteArray): HomeNetworkAuthorization? {
         val binding = settingsRepository.homeNetworkBinding() ?: return null
-        val current = identity.current() ?: return null
+        val current = identity.matching(binding.networkFingerprint) ?: return null
         val deviceFingerprint = identity.deviceFingerprint(deviceIdentifier) ?: return null
         if (
             !HomeNetworkPolicy.allowsAutomaticAccess(

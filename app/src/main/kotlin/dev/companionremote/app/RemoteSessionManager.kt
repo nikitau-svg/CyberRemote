@@ -288,6 +288,62 @@ class RemoteSessionManager private constructor(context: Context) {
         return result.await()
     }
 
+    /**
+     * Best-effort request for a fresh Companion Now Playing push.
+     *
+     * Unlike a remote command this never enters [commandQueue], reconnects a
+     * missing session or changes playback. The session lock keeps the active
+     * client from being closed while its one fire-and-forget event is sent.
+     */
+    suspend fun refreshNowPlaying(): Boolean = sessionMutex.withLock {
+        val current = client
+        val active = current != null && _connectionState.value == ConnectionState.Connected
+        Diagnostics.record(
+            appContext,
+            "now_playing_refresh",
+            "attempt",
+            "active_client" to active,
+        )
+        if (!active || current == null) {
+            Diagnostics.record(
+                appContext,
+                "now_playing_refresh",
+                "result",
+                "success" to false,
+                "outcome" to DiagnosticToken("inactive_client"),
+            )
+            return@withLock false
+        }
+
+        val outcome = try {
+            withTimeout(NOW_PLAYING_REFRESH_TIMEOUT_MS) {
+                current.refreshNowPlaying()
+            }
+            NowPlayingRefreshOutcome.Sent
+        } catch (_: TimeoutCancellationException) {
+            NowPlayingRefreshOutcome.TimedOut
+        } catch (e: CancellationException) {
+            Diagnostics.record(
+                appContext,
+                "now_playing_refresh",
+                "result",
+                "success" to false,
+                "outcome" to DiagnosticToken("cancelled"),
+            )
+            throw e
+        } catch (_: Exception) {
+            NowPlayingRefreshOutcome.Failed
+        }
+        Diagnostics.record(
+            appContext,
+            "now_playing_refresh",
+            "result",
+            "success" to (outcome == NowPlayingRefreshOutcome.Sent),
+            "outcome" to DiagnosticToken(outcome.diagnosticToken),
+        )
+        outcome == NowPlayingRefreshOutcome.Sent
+    }
+
     private suspend fun executeImmediate(request: CommandRequest): Boolean =
         sessionMutex.withLock {
             try {
@@ -667,6 +723,7 @@ class RemoteSessionManager private constructor(context: Context) {
         private const val CONNECT_TIMEOUT_MS = 2_500
         private const val SESSION_TIMEOUT_MS = 15_000L
         private const val COMMAND_TIMEOUT_MS = 10_000L
+        private const val NOW_PLAYING_REFRESH_TIMEOUT_MS = 2_000L
         private const val DISCONNECT_TIMEOUT_MS = 2_000L
         private const val COMMAND_QUEUE_CAPACITY = 256
         private const val CONNECTION_AUTH_POLL_MS = 50L
@@ -681,6 +738,12 @@ class RemoteSessionManager private constructor(context: Context) {
                 instance ?: RemoteSessionManager(context).also { instance = it }
             }
     }
+}
+
+private enum class NowPlayingRefreshOutcome(val diagnosticToken: String) {
+    Sent("sent"),
+    TimedOut("timed_out"),
+    Failed("failed"),
 }
 
 private class ConnectionAuthorizationRevoked : Exception()

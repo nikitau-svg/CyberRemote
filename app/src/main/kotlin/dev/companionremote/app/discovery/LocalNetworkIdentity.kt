@@ -88,6 +88,15 @@ internal class LocalNetworkIdentity(context: Context) {
         return snapshot(network)
     }
 
+    /** Find the bound LAN even when Android exposes multiple physical Networks. */
+    fun matching(expectedFingerprint: String): LocalNetworkSnapshot? {
+        if (!appContext.hasLocalNetworkPermission()) return null
+        return physicalNetworks()
+            .asSequence()
+            .mapNotNull(::snapshot)
+            .firstOrNull { it.fingerprint == expectedFingerprint }
+    }
+
     /** Recomputes every fingerprint input for this exact Android Network. */
     fun snapshot(network: Network): LocalNetworkSnapshot? {
         if (!appContext.hasLocalNetworkPermission()) return null
@@ -107,14 +116,17 @@ internal class LocalNetworkIdentity(context: Context) {
         }.getOrNull()
 
     private fun currentPhysicalNetwork(): Network? {
+        return physicalNetworks().firstOrNull()
+    }
+
+    private fun physicalNetworks(): List<Network> {
         val active = connectivityManager.activeNetwork
-        val candidates = buildList {
+        return buildList {
             if (active != null) add(active)
             connectivityManager.allNetworks.forEach { if (it != active) add(it) }
-        }
-        return candidates.firstOrNull { network ->
+        }.filter { network ->
             val capabilities = connectivityManager.getNetworkCapabilities(network)
-                ?: return@firstOrNull false
+                ?: return@filter false
             capabilities.isPhysicalLan()
         }
     }
