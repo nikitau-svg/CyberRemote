@@ -1,10 +1,12 @@
 package dev.companionremote.app.quick
 
+import android.app.ActivityOptions
 import android.app.PendingIntent
 import android.content.Intent
 import android.os.Build
 import android.service.quicksettings.Tile
 import android.service.quicksettings.TileService
+import android.widget.Toast
 import dev.companionremote.app.ConnectionState
 import dev.companionremote.app.MainActivity
 import dev.companionremote.app.RemoteSessionManager
@@ -83,31 +85,75 @@ class RemoteTileService : TileService() {
     }
 
     private fun launchActivity(intent: Intent, allowWhileLocked: Boolean) {
+        val creatorOptions = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
+            ActivityOptions.makeBasic()
+                .setPendingIntentCreatorBackgroundActivityStartMode(
+                    ActivityOptions.MODE_BACKGROUND_ACTIVITY_START_ALLOWED,
+                )
+                .toBundle()
+        } else {
+            null
+        }
+        val pendingIntent = PendingIntent.getActivity(
+            this,
+            if (allowWhileLocked) 701 else 702,
+            intent,
+            PendingIntent.FLAG_CANCEL_CURRENT or PendingIntent.FLAG_IMMUTABLE,
+            creatorOptions,
+        )
         if (!allowWhileLocked) {
-            unlockAndRun { runCatching { startActivity(intent) } }
+            runAfterUnlock(pendingIntent)
             return
         }
         try {
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
-                startActivityAndCollapse(
-                    PendingIntent.getActivity(
-                        this,
-                        701,
-                        intent,
-                        PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE,
-                    ),
-                )
+                startActivityAndCollapse(pendingIntent)
             } else {
                 @Suppress("DEPRECATION")
                 startActivityAndCollapse(intent)
             }
         } catch (_: RuntimeException) {
-            // Retry the direct launch first so an OEM quirk does not silently
-            // defeat the user's explicit lock-screen-controls preference.
-            if (runCatching { startActivity(intent) }.isFailure) {
-                unlockAndRun { runCatching { startActivity(intent) } }
-            }
+            // Some OEM SystemUI builds reject startActivityAndCollapse even for
+            // a user click. A PendingIntent keeps the fallback explicit and
+            // avoids relying on a background startActivity call.
+            if (!send(pendingIntent)) runAfterUnlock(pendingIntent)
         }
+    }
+
+    private fun runAfterUnlock(pendingIntent: PendingIntent) {
+        try {
+            unlockAndRun {
+                if (!send(pendingIntent)) showLaunchError()
+            }
+        } catch (_: RuntimeException) {
+            showLaunchError()
+        }
+    }
+
+    private fun send(pendingIntent: PendingIntent): Boolean = try {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
+            val senderOptions = ActivityOptions.makeBasic()
+                .setPendingIntentBackgroundActivityStartMode(
+                    ActivityOptions.MODE_BACKGROUND_ACTIVITY_START_ALLOWED,
+                )
+                .toBundle()
+            pendingIntent.send(senderOptions)
+        } else {
+            pendingIntent.send()
+        }
+        true
+    } catch (_: PendingIntent.CanceledException) {
+        false
+    } catch (_: RuntimeException) {
+        false
+    }
+
+    private fun showLaunchError() {
+        Toast.makeText(
+            applicationContext,
+            "Couldn't open the remote. Open CyberRemote from Apps.",
+            Toast.LENGTH_SHORT,
+        ).show()
     }
 
     override fun onDestroy() {

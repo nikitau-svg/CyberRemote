@@ -390,18 +390,22 @@ private fun FullRemoteScreen(
             .systemBarsPadding()
             .safeGesturesPadding(),
     ) {
-        val compact = maxHeight < 620.dp
-        val outerSpacing = if (compact) 8.dp else 20.dp
-        val controlSpacing = if (compact) 8.dp else 16.dp
-        val roundKeySize = if (compact) 56.dp else 72.dp
-        val volumeHeight = if (compact) 46.dp else 56.dp
         val availableWidth = maxWidth
         val availableHeight = maxHeight
+        val compact = availableHeight < 620.dp || availableWidth < 380.dp
+        val veryCompact = availableHeight < 360.dp || availableWidth < 340.dp
+        val horizontalLayout =
+            availableWidth > availableHeight && availableWidth >= 320.dp
+        val outerSpacing = if (veryCompact) 6.dp else if (compact) 8.dp else 20.dp
+        val controlSpacing = if (veryCompact) 6.dp else if (compact) 8.dp else 16.dp
+        val roundKeySize = if (veryCompact) 42.dp else if (compact) 56.dp else 72.dp
+        val volumeHeight = if (veryCompact) 40.dp else if (compact) 46.dp else 56.dp
+        val horizontalPadding = if (availableWidth < 420.dp) 12.dp else 20.dp
 
         Column(
             Modifier
                 .fillMaxSize()
-                .padding(horizontal = 20.dp, vertical = if (compact) 6.dp else 10.dp),
+                .padding(horizontal = horizontalPadding, vertical = if (compact) 6.dp else 10.dp),
             horizontalAlignment = Alignment.CenterHorizontally,
         ) {
             Row(
@@ -443,11 +447,13 @@ private fun FullRemoteScreen(
                 )
             }
 
-            if (compact && availableWidth >= 560.dp && availableWidth > availableHeight) {
+            if (horizontalLayout) {
                 val sideWidth = when {
                     availableWidth >= 800.dp -> 320.dp
                     availableWidth >= 650.dp -> 270.dp
-                    else -> 220.dp
+                    availableWidth >= 520.dp -> 220.dp
+                    availableWidth >= 420.dp -> 180.dp
+                    else -> 140.dp
                 }
                 Spacer(Modifier.height(outerSpacing))
                 Row(
@@ -459,7 +465,7 @@ private fun FullRemoteScreen(
                         selectRequiresUnlock = keyguardLocked,
                         onAction = onAction,
                     )
-                    Spacer(Modifier.width(16.dp))
+                    Spacer(Modifier.width(if (availableWidth < 520.dp) 8.dp else 16.dp))
                     Column(
                         Modifier.width(sideWidth).fillMaxHeight(),
                         verticalArrangement = Arrangement.Center,
@@ -468,7 +474,9 @@ private fun FullRemoteScreen(
                         RemoteKeyRow(keyguardLocked, roundKeySize, onAction)
                         Spacer(Modifier.height(controlSpacing))
                         VolumeBar(onAction, volumeHeight)
-                        LockHint(keyguardLocked, lockScreenControlsEnabled, compact)
+                        if (availableHeight >= 240.dp) {
+                            LockHint(keyguardLocked, lockScreenControlsEnabled, compact)
+                        }
                     }
                 }
             } else {
