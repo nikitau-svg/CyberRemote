@@ -54,6 +54,80 @@ class CompanionNowPlayingTest {
         assertNull(CompanionNowPlayingParser.parse(emptyMap()))
     }
 
+    @Test
+    fun `metadata-only update retains explicit playing state for the same item`() {
+        val playing = parse(
+            linkedMapOf(
+                "playbackRate" to 1.0,
+                "contentIdentifier" to "episode-1",
+            ),
+            capturedAtNanos = 10,
+        )
+        val metadata = parse(
+            linkedMapOf(
+                "contentIdentifier" to "episode-1",
+                "episodeTitle" to "Pilot",
+                "duration" to 120.0,
+                "imageURLTemplate" to "http://apple-tv.local/image/{w}x{h}",
+            ),
+            capturedAtNanos = 20,
+        )
+
+        val merged = metadata.withMissingFieldsFrom(playing)
+
+        assertEquals(CompanionPlaybackState.Playing, merged.playbackState)
+        assertEquals(1.0, merged.playbackRate)
+        assertEquals("Pilot", merged.title)
+        assertEquals(120_000L, merged.durationMs)
+        assertTrue(merged.artworkId?.isNotBlank() == true)
+        assertEquals(20L, merged.capturedAtNanos)
+    }
+
+    @Test
+    fun `explicit paused update replaces previous playing state`() {
+        val playing = parse(mapOf("playbackRate" to 1.0), capturedAtNanos = 10)
+        val paused = parse(mapOf("playbackRate" to 0.0), capturedAtNanos = 20)
+
+        val merged = paused.withMissingFieldsFrom(playing)
+
+        assertEquals(CompanionPlaybackState.Paused, merged.playbackState)
+        assertEquals(0.0, merged.playbackRate)
+    }
+
+    @Test
+    fun `new content id does not inherit stale playback or metadata`() {
+        val previous = parse(
+            linkedMapOf(
+                "playbackRate" to 1.0,
+                "contentIdentifier" to "episode-1",
+                "episodeTitle" to "Pilot",
+            ),
+            capturedAtNanos = 10,
+        )
+        val next = parse(
+            linkedMapOf(
+                "contentIdentifier" to "episode-2",
+                "episodeTitle" to "Finale",
+            ),
+            capturedAtNanos = 20,
+        )
+
+        val merged = next.withMissingFieldsFrom(previous)
+
+        assertEquals(CompanionPlaybackState.Unknown, merged.playbackState)
+        assertNull(merged.playbackRate)
+        assertEquals("Finale", merged.title)
+        assertEquals("episode-2", merged.contentId)
+    }
+
+    private fun parse(properties: Map<String, Any?>, capturedAtNanos: Long): CompanionNowPlayingInfo =
+        requireNotNull(
+            CompanionNowPlayingParser.parse(
+                mapOf("NowPlayingInfoKey" to archive(properties)),
+                capturedAtNanos = capturedAtNanos,
+            ),
+        )
+
     private fun archive(properties: Map<String, Any?>): ByteArray {
         val root = linkedMapOf<String, Any?>("\$class" to PlistUid(2))
         val objects = mutableListOf<Any?>(

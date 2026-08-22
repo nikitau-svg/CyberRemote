@@ -81,7 +81,7 @@ class CompanionClient(
                 when (event.name) {
                     "_tiStarted", "_tiStopped" -> onFocusEvent(event.content)
                     NOW_PLAYING_EVENT -> CompanionNowPlayingParser.parse(event.content)?.let { update ->
-                        _nowPlaying.value = update.withMissingMetadataFrom(_nowPlaying.value)
+                        _nowPlaying.value = update.withMissingFieldsFrom(_nowPlaying.value)
                     }
                 }
             }
@@ -445,25 +445,6 @@ class CompanionClient(
 
     private fun macLike(hex: String): String =
         (0 until 6).joinToString(":") { hex.substring(it * 2, it * 2 + 2).uppercase() }
-
-    private fun CompanionNowPlayingInfo.withMissingMetadataFrom(
-        previous: CompanionNowPlayingInfo?,
-    ): CompanionNowPlayingInfo {
-        if (previous == null || (contentId != null && contentId != previous.contentId)) return this
-        return copy(
-            title = title ?: previous.title,
-            artist = artist ?: previous.artist,
-            album = album ?: previous.album,
-            seriesName = seriesName ?: previous.seriesName,
-            episodeNumber = episodeNumber ?: previous.episodeNumber,
-            durationMs = durationMs ?: previous.durationMs,
-            positionMs = positionMs ?: previous.positionMs,
-            contentId = contentId ?: previous.contentId,
-            artworkUrlTemplate = artworkUrlTemplate ?: previous.artworkUrlTemplate,
-            artworkData = artworkData ?: previous.artworkData,
-            artworkId = artworkId ?: previous.artworkId,
-        )
-    }
 
     companion object {
         private const val SERVICE_TYPE = "com.apple.tvremoteservices"

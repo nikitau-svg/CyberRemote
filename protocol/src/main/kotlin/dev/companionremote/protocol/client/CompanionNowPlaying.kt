@@ -66,6 +66,38 @@ data class CompanionNowPlayingInfo(
     }
 }
 
+/**
+ * tvOS sends NowPlayingInfo as a sequence of partial payloads. A metadata-only
+ * payload has no playbackRate, so the parser deliberately marks its state as
+ * Unknown. For the same media item, retain the last explicit transport state
+ * while accepting the newly supplied metadata. A new content id remains a
+ * hard boundary so stale state or artwork cannot leak into the next item.
+ */
+internal fun CompanionNowPlayingInfo.withMissingFieldsFrom(
+    previous: CompanionNowPlayingInfo?,
+): CompanionNowPlayingInfo {
+    if (previous == null || (contentId != null && contentId != previous.contentId)) return this
+    return copy(
+        playbackState = if (playbackState == CompanionPlaybackState.Unknown) {
+            previous.playbackState
+        } else {
+            playbackState
+        },
+        playbackRate = playbackRate ?: previous.playbackRate,
+        title = title ?: previous.title,
+        artist = artist ?: previous.artist,
+        album = album ?: previous.album,
+        seriesName = seriesName ?: previous.seriesName,
+        episodeNumber = episodeNumber ?: previous.episodeNumber,
+        durationMs = durationMs ?: previous.durationMs,
+        positionMs = positionMs ?: previous.positionMs,
+        contentId = contentId ?: previous.contentId,
+        artworkUrlTemplate = artworkUrlTemplate ?: previous.artworkUrlTemplate,
+        artworkData = artworkData ?: previous.artworkData,
+        artworkId = artworkId ?: previous.artworkId,
+    )
+}
+
 internal object CompanionNowPlayingParser {
 
     fun parse(
