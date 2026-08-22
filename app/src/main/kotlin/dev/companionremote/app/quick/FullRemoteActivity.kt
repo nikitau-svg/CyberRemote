@@ -395,6 +395,8 @@ private fun FullRemoteScreen(
         val controlSpacing = if (compact) 8.dp else 16.dp
         val roundKeySize = if (compact) 56.dp else 72.dp
         val volumeHeight = if (compact) 46.dp else 56.dp
+        val availableWidth = maxWidth
+        val availableHeight = maxHeight
 
         Column(
             Modifier
@@ -441,10 +443,10 @@ private fun FullRemoteScreen(
                 )
             }
 
-            if (compact && maxWidth >= 560.dp && maxWidth > maxHeight) {
+            if (compact && availableWidth >= 560.dp && availableWidth > availableHeight) {
                 val sideWidth = when {
-                    maxWidth >= 800.dp -> 320.dp
-                    maxWidth >= 650.dp -> 270.dp
+                    availableWidth >= 800.dp -> 320.dp
+                    availableWidth >= 650.dp -> 270.dp
                     else -> 220.dp
                 }
                 Spacer(Modifier.height(outerSpacing))
