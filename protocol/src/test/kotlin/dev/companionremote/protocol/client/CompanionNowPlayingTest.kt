@@ -101,6 +101,8 @@ class CompanionNowPlayingTest {
                 "playbackRate" to 1.0,
                 "contentIdentifier" to "episode-1",
                 "episodeTitle" to "Pilot",
+                "duration" to 120.0,
+                "imageURLTemplate" to "http://apple-tv.local/image/{w}x{h}",
             ),
             capturedAtNanos = 10,
         )
@@ -121,35 +123,92 @@ class CompanionNowPlayingTest {
     }
 
     @Test
-    fun `explicit no-media update clears stale playback and metadata`() {
+    fun `explicit-null envelope after transport update retains last confirmed state`() {
         val playing = parse(
             linkedMapOf(
                 "playbackRate" to 1.0,
                 "contentIdentifier" to "episode-1",
                 "episodeTitle" to "Pilot",
+                "duration" to 120.0,
+                "imageURLTemplate" to "http://apple-tv.local/image/{w}x{h}",
             ),
             capturedAtNanos = 10,
         )
-        val noMedia = parse(
-            linkedMapOf(
-                "playbackRate" to null,
-                "playbackState" to null,
-                "metadata" to null,
-                "imageData" to null,
-                "identifier" to null,
-                "playerIdentifier" to null,
-            ),
-            capturedAtNanos = 20,
-        )
+        val intermediate = parse(explicitNullEnvelope(), capturedAtNanos = 20)
 
-        val merged = noMedia.withMissingFieldsFrom(playing)
+        val merged = intermediate.withMissingFieldsFrom(playing)
 
-        assertEquals(CompanionPlaybackState.Unknown, merged.playbackState)
-        assertNull(merged.playbackRate)
-        assertNull(merged.title)
-        assertNull(merged.contentId)
-        assertTrue(merged.explicitlyCleared)
+        assertEquals(CompanionPlaybackState.Playing, merged.playbackState)
+        assertEquals(1.0, merged.playbackRate)
+        assertEquals("Pilot", merged.title)
+        assertEquals("episode-1", merged.contentId)
+        assertEquals(120_000L, merged.durationMs)
+        assertTrue(merged.artworkId?.isNotBlank() == true)
     }
+
+    @Test
+    fun `explicit-null envelope after pause retains paused state`() {
+        val paused = parse(
+            linkedMapOf(
+                "playbackRate" to 0.0,
+                "contentIdentifier" to "episode-1",
+                "episodeTitle" to "Pilot",
+            ),
+            capturedAtNanos = 10,
+        )
+        val intermediate = parse(explicitNullEnvelope(), capturedAtNanos = 20)
+
+        val merged = intermediate.withMissingFieldsFrom(paused)
+
+        assertEquals(CompanionPlaybackState.Paused, merged.playbackState)
+        assertEquals(0.0, merged.playbackRate)
+        assertEquals("Pilot", merged.title)
+        assertEquals("episode-1", merged.contentId)
+    }
+
+    @Test
+    fun `runtime transport sequence never falls back to unknown after first confirmed state`() {
+        val updates = listOf(
+            parse(explicitNullEnvelope(), capturedAtNanos = 10),
+            parse(mapOf("playbackRate" to 1.0), capturedAtNanos = 20),
+            parse(
+                linkedMapOf(
+                    "episodeTitle" to "Pilot",
+                ),
+                capturedAtNanos = 30,
+            ),
+            parse(explicitNullEnvelope(), capturedAtNanos = 40),
+            parse(mapOf("playbackRate" to 0.0), capturedAtNanos = 50),
+            parse(explicitNullEnvelope(), capturedAtNanos = 60),
+        )
+        var merged: CompanionNowPlayingInfo? = null
+
+        val observed = updates.map { update ->
+            merged = update.withMissingFieldsFrom(merged)
+            requireNotNull(merged).playbackState
+        }
+
+        assertEquals(
+            listOf(
+                CompanionPlaybackState.Unknown,
+                CompanionPlaybackState.Playing,
+                CompanionPlaybackState.Playing,
+                CompanionPlaybackState.Playing,
+                CompanionPlaybackState.Paused,
+                CompanionPlaybackState.Paused,
+            ),
+            observed,
+        )
+    }
+
+    private fun explicitNullEnvelope(): Map<String, Any?> = linkedMapOf(
+        "playbackRate" to null,
+        "playbackState" to null,
+        "metadata" to null,
+        "imageData" to null,
+        "identifier" to null,
+        "playerIdentifier" to null,
+    )
 
     private fun parse(properties: Map<String, Any?>, capturedAtNanos: Long): CompanionNowPlayingInfo =
         requireNotNull(

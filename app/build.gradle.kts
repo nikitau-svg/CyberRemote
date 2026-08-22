@@ -14,8 +14,8 @@ android {
         applicationId = "dev.companionremote.nikita"
         minSdk = 26
         targetSdk = 35
-        versionCode = 11
-        versionName = "1.3.3-playback-state-sync"
+        versionCode = 12
+        versionName = "1.3.4-playback-permissions"
     }
 
     buildTypes {

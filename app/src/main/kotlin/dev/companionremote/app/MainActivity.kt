@@ -1,6 +1,6 @@
 package dev.companionremote.app
 
-import android.content.pm.PackageManager
+import android.Manifest
 import android.content.Intent
 import android.os.Build
 import android.os.Bundle
@@ -25,11 +25,17 @@ import dev.companionremote.app.data.ThemeMode
 import dev.companionremote.app.diagnostics.Diagnostics
 import dev.companionremote.app.diagnostics.Diagnostics.DiagnosticToken
 import dev.companionremote.app.discovery.ACCESS_LOCAL_NETWORK_PERMISSION
-import dev.companionremote.app.discovery.LocalNetworkPermissionGate
-import dev.companionremote.app.discovery.LocalNetworkScanAction
+import dev.companionremote.app.discovery.hasLocalNetworkPermission
 import dev.companionremote.app.i18n.LocalAppStrings
 import dev.companionremote.app.i18n.currentSystemLanguage
 import dev.companionremote.app.i18n.resolveStrings
+import dev.companionremote.app.permissions.AppEntryPermissionAction
+import dev.companionremote.app.permissions.AppEntryPermissionGate
+import dev.companionremote.app.permissions.AppRuntimePermission
+import dev.companionremote.app.permissions.AppRuntimePermissionState
+import dev.companionremote.app.permissions.hasMicrophoneRuntimePermission
+import dev.companionremote.app.permissions.hasNotificationRuntimePermission
+import dev.companionremote.app.permissions.missingAppRuntimePermissions
 import dev.companionremote.app.theme.LocalGlass
 import dev.companionremote.app.theme.skinBackground
 import dev.companionremote.app.theme.skinColorScheme
@@ -42,17 +48,23 @@ import dev.companionremote.app.ui.SettingsScreen
 class MainActivity : ComponentActivity() {
 
     private val viewModel: AppViewModel by viewModels()
-    private val localNetworkPermissionGate = LocalNetworkPermissionGate()
-    private val localNetworkPermission = registerForActivityResult(
-        ActivityResultContracts.RequestPermission(),
-    ) { granted ->
-        Diagnostics.record(
-            this,
-            "local_network_permission",
-            "result",
-            "granted" to granted,
+    private val appEntryPermissionGate = AppEntryPermissionGate()
+    private val appPermissions = registerForActivityResult(
+        ActivityResultContracts.RequestMultiplePermissions(),
+    ) { results ->
+        results.forEach { (permission, granted) ->
+            Diagnostics.record(
+                this,
+                "app_permissions",
+                "result",
+                "permission" to DiagnosticToken(permission.diagnosticPermissionName()),
+                "granted" to granted,
+            )
+        }
+        handleAppEntryPermissionAction(
+            appEntryPermissionGate.permissionResult(hasLocalNetworkPermission()),
         )
-        handleLocalNetworkScanAction(localNetworkPermissionGate.permissionResult(granted))
+        viewModel.onRuntimePermissionsChanged()
     }
 
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -70,7 +82,7 @@ class MainActivity : ComponentActivity() {
                         when (val current = screen) {
                             is Screen.DeviceList -> DeviceListScreen(
                                 viewModel = viewModel,
-                                onRescan = { scanWithLocalNetworkPermission(userInitiated = true) },
+                                onRescan = { ensureEntryPermissionsThenScan(userInitiated = true) },
                             )
                             is Screen.Settings -> SettingsScreen(viewModel)
                             is Screen.Pairing -> PairingScreen(viewModel, current.device)
@@ -81,13 +93,16 @@ class MainActivity : ComponentActivity() {
             }
         }
         handleIntent(intent)
-        scanWithLocalNetworkPermission(userInitiated = false)
+        appEntryPermissionGate.beginEntry()
+        ensureEntryPermissionsThenScan(userInitiated = false)
     }
 
     override fun onNewIntent(intent: Intent) {
         super.onNewIntent(intent)
         setIntent(intent)
         handleIntent(intent)
+        appEntryPermissionGate.beginEntry()
+        ensureEntryPermissionsThenScan(userInitiated = false)
     }
 
     private fun handleIntent(intent: Intent?) {
@@ -98,37 +113,59 @@ class MainActivity : ComponentActivity() {
         }
     }
 
-    private fun scanWithLocalNetworkPermission(userInitiated: Boolean) {
-        val permissionGranted = Build.VERSION.SDK_INT < 37 ||
-            checkSelfPermission(ACCESS_LOCAL_NETWORK_PERMISSION) == PackageManager.PERMISSION_GRANTED
-        handleLocalNetworkScanAction(
-            localNetworkPermissionGate.requestScan(
-                userInitiated = userInitiated,
-                sdkInt = Build.VERSION.SDK_INT,
-                permissionGranted = permissionGranted,
-            ),
+    private fun ensureEntryPermissionsThenScan(userInitiated: Boolean) {
+        val missing = missingAppRuntimePermissions(
+            sdkInt = Build.VERSION.SDK_INT,
+            state = currentRuntimePermissionState(),
+        )
+        handleAppEntryPermissionAction(
+            appEntryPermissionGate.requestPermissionsThenScan(userInitiated, missing),
         )
     }
 
-    private fun handleLocalNetworkScanAction(action: LocalNetworkScanAction) {
+    private fun handleAppEntryPermissionAction(action: AppEntryPermissionAction) {
         when (action) {
-            is LocalNetworkScanAction.RunScan -> viewModel.startScan(action.userInitiated)
-            LocalNetworkScanAction.RequestPermission -> {
+            is AppEntryPermissionAction.RunScan -> viewModel.startScan(action.userInitiated)
+            is AppEntryPermissionAction.Request -> {
                 Diagnostics.record(
                     this,
-                    "local_network_permission",
+                    "app_permissions",
                     "requested",
                     "sdk" to Build.VERSION.SDK_INT,
+                    "local_network" to (AppRuntimePermission.LocalNetwork in action.permissions),
+                    "notifications" to (AppRuntimePermission.Notifications in action.permissions),
+                    "microphone" to (AppRuntimePermission.Microphone in action.permissions),
                 )
-                localNetworkPermission.launch(ACCESS_LOCAL_NETWORK_PERMISSION)
+                appPermissions.launch(action.permissions.map { it.androidPermissionName() }.toTypedArray())
             }
-            LocalNetworkScanAction.None -> Diagnostics.record(
+            AppEntryPermissionAction.SkipScan -> Diagnostics.record(
                 this,
                 "discovery",
                 "scan_skipped",
                 "reason" to DiagnosticToken("permission"),
             )
+            AppEntryPermissionAction.None -> Unit
         }
+    }
+
+    private fun currentRuntimePermissionState(): AppRuntimePermissionState =
+        AppRuntimePermissionState(
+            localNetworkGranted = hasLocalNetworkPermission(),
+            notificationsGranted = hasNotificationRuntimePermission(),
+            microphoneGranted = hasMicrophoneRuntimePermission(),
+        )
+
+    private fun AppRuntimePermission.androidPermissionName(): String = when (this) {
+        AppRuntimePermission.LocalNetwork -> ACCESS_LOCAL_NETWORK_PERMISSION
+        AppRuntimePermission.Notifications -> Manifest.permission.POST_NOTIFICATIONS
+        AppRuntimePermission.Microphone -> Manifest.permission.RECORD_AUDIO
+    }
+
+    private fun String.diagnosticPermissionName(): String = when (this) {
+        ACCESS_LOCAL_NETWORK_PERMISSION -> "local_network"
+        Manifest.permission.POST_NOTIFICATIONS -> "notifications"
+        Manifest.permission.RECORD_AUDIO -> "microphone"
+        else -> "unknown"
     }
 
     override fun onStart() {

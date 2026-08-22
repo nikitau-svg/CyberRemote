@@ -1,16 +1,13 @@
 package dev.companionremote.app.quick
 
-import android.Manifest
 import android.app.KeyguardManager
 import android.content.Intent
-import android.content.pm.PackageManager
 import android.graphics.Color as AndroidColor
 import android.os.Build
 import android.os.Bundle
 import android.view.WindowManager
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
-import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.gestures.detectDragGestures
@@ -76,11 +73,15 @@ import androidx.compose.ui.unit.sp
 import androidx.lifecycle.lifecycleScope
 import androidx.lifecycle.Lifecycle
 import dev.companionremote.app.ConnectionState
+import dev.companionremote.app.MainActivity
 import dev.companionremote.app.R
 import dev.companionremote.app.RemoteSessionManager
 import dev.companionremote.app.data.SettingsRepository
 import dev.companionremote.app.diagnostics.Diagnostics
 import dev.companionremote.app.diagnostics.Diagnostics.DiagnosticToken
+import dev.companionremote.app.discovery.hasLocalNetworkPermission
+import dev.companionremote.app.permissions.appNotificationSettingsIntent
+import dev.companionremote.app.permissions.hasNotificationRuntimePermission
 import kotlin.math.abs
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
@@ -100,20 +101,9 @@ class FullRemoteActivity : ComponentActivity() {
     private var unlockRequestGeneration = 0L
     private var launchCapabilityRequired = false
     private var launchCapability: String? = null
-    private var notificationPermissionRequestInProgress = false
     private var keyguardMonitorJob: Job? = null
     @Volatile private var acceptingActivityCommands = false
     @Volatile private var activityEpoch = 0L
-
-    private val notificationPermission = registerForActivityResult(
-        ActivityResultContracts.RequestPermission(),
-    ) { granted ->
-        notificationPermissionRequestInProgress = false
-        Diagnostics.record(this, "full_remote", "notification_permission_result", "granted" to granted)
-        if (granted && acceptingActivityCommands && !keyguard.isKeyguardLocked) {
-            connectUnlocked()
-        }
-    }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -256,15 +246,26 @@ class FullRemoteActivity : ComponentActivity() {
     }
 
     private fun connectUnlocked() {
-        if (
-            Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU &&
-            checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED
-        ) {
-            if (!notificationPermissionRequestInProgress) {
-                Diagnostics.record(this, "full_remote", "service_start_deferred", "reason" to DiagnosticToken("notification_permission"))
-                notificationPermissionRequestInProgress = true
-                notificationPermission.launch(Manifest.permission.POST_NOTIFICATIONS)
-            }
+        if (!hasLocalNetworkPermission() || !hasNotificationRuntimePermission()) {
+            Diagnostics.record(
+                this,
+                "full_remote",
+                "permission_gate_redirect",
+                "local_network" to hasLocalNetworkPermission(),
+                "notifications" to hasNotificationRuntimePermission(),
+            )
+            openPermissionGate()
+            return
+        }
+        if (!RemoteControlService.notificationsEnabled(this)) {
+            Diagnostics.record(
+                this,
+                "full_remote",
+                "service_start_deferred",
+                "reason" to DiagnosticToken("notifications_blocked"),
+            )
+            startActivity(appNotificationSettingsIntent())
+            finish()
             return
         }
         val expectedCapability = launchCapability.takeIf { launchCapabilityRequired }
@@ -276,6 +277,15 @@ class FullRemoteActivity : ComponentActivity() {
         )
         runCatching { RemoteControlService.start(this, expectedCapability) }
             .onFailure { Diagnostics.exception(this, "full_remote", "service_start", it) }
+    }
+
+    private fun openPermissionGate() {
+        startActivity(
+            Intent(this, MainActivity::class.java).addFlags(
+                Intent.FLAG_ACTIVITY_CLEAR_TOP or Intent.FLAG_ACTIVITY_SINGLE_TOP,
+            ),
+        )
+        finish()
     }
 
     private fun dispatch(action: QuickRemoteAction) {

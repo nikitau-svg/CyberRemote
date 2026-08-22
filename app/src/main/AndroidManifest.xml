@@ -11,8 +11,8 @@
          silently finds nothing on many devices. -->
     <uses-permission android:name="android.permission.CHANGE_WIFI_MULTICAST_STATE" />
     <uses-permission android:name="android.permission.ACCESS_WIFI_STATE" />
-    <!-- Voice input (dictation into TV search boxes). Optional: requested only
-         when the user taps the mic; on-device recognition is preferred. -->
+    <!-- Voice input (dictation into TV search boxes). Requested with the other
+         runtime permissions at app entry and rechecked before microphone use. -->
     <uses-permission android:name="android.permission.RECORD_AUDIO" />
     <!-- Button-press vibration feedback (normal permission, auto-granted). -->
     <uses-permission android:name="android.permission.VIBRATE" />

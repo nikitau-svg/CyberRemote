@@ -1,16 +1,12 @@
 package dev.companionremote.app.quick
 
-import android.Manifest
 import android.app.KeyguardManager
 import android.content.Intent
-import android.content.pm.PackageManager
-import android.os.Build
 import android.os.Bundle
 import android.view.Gravity
 import android.view.WindowManager
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
-import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.ExperimentalFoundationApi
 import androidx.compose.foundation.combinedClickable
 import androidx.compose.foundation.layout.Arrangement
@@ -62,6 +58,11 @@ import dev.companionremote.app.MainActivity
 import dev.companionremote.app.R
 import dev.companionremote.app.RemoteSessionManager
 import dev.companionremote.app.data.AppSkin
+import dev.companionremote.app.diagnostics.Diagnostics
+import dev.companionremote.app.diagnostics.Diagnostics.DiagnosticToken
+import dev.companionremote.app.discovery.hasLocalNetworkPermission
+import dev.companionremote.app.permissions.appNotificationSettingsIntent
+import dev.companionremote.app.permissions.hasNotificationRuntimePermission
 import dev.companionremote.app.theme.skinColorScheme
 import kotlinx.coroutines.launch
 
@@ -69,18 +70,6 @@ import kotlinx.coroutines.launch
 class RemotePanelActivity : ComponentActivity() {
 
     private lateinit var session: RemoteSessionManager
-    private var persistentControlsEnabled = false
-
-    private val notificationPermission = registerForActivityResult(
-        ActivityResultContracts.RequestPermission(),
-    ) { granted ->
-        persistentControlsEnabled = granted && RemoteControlService.notificationsEnabled(this)
-        if (persistentControlsEnabled) {
-            RemoteControlService.start(this)
-        } else {
-            RemoteControlService.stop(this)
-        }
-    }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -117,18 +106,28 @@ class RemotePanelActivity : ComponentActivity() {
             }
         }
 
-        if (
-            Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU &&
-            checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED
-        ) {
-            notificationPermission.launch(Manifest.permission.POST_NOTIFICATIONS)
+        if (!hasLocalNetworkPermission() || !hasNotificationRuntimePermission()) {
+            Diagnostics.record(
+                this,
+                "remote_panel",
+                "permission_gate_redirect",
+                "local_network" to hasLocalNetworkPermission(),
+                "notifications" to hasNotificationRuntimePermission(),
+            )
+            RemoteControlService.stop(this)
+            openPermissionGate()
+        } else if (RemoteControlService.notificationsEnabled(this)) {
+            RemoteControlService.start(this)
         } else {
-            persistentControlsEnabled = RemoteControlService.notificationsEnabled(this)
-            if (persistentControlsEnabled) {
-                RemoteControlService.start(this)
-            } else {
-                RemoteControlService.stop(this)
-            }
+            Diagnostics.record(
+                this,
+                "remote_panel",
+                "service_start_deferred",
+                "reason" to DiagnosticToken("notifications_blocked"),
+            )
+            RemoteControlService.stop(this)
+            startActivity(appNotificationSettingsIntent())
+            finish()
         }
     }
 
@@ -148,6 +147,15 @@ class RemotePanelActivity : ComponentActivity() {
 
     private fun sendAction(action: QuickRemoteAction) {
         lifecycleScope.launch { action.execute(session, requireUnlocked = true) }
+    }
+
+    private fun openPermissionGate() {
+        startActivity(
+            Intent(this, MainActivity::class.java).addFlags(
+                Intent.FLAG_ACTIVITY_CLEAR_TOP or Intent.FLAG_ACTIVITY_SINGLE_TOP,
+            ),
+        )
+        finish()
     }
 }
 

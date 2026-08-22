@@ -168,6 +168,7 @@ object Diagnostics {
             appendLine("Android: ${token(Build.VERSION.RELEASE)} (SDK ${Build.VERSION.SDK_INT})")
             appendLine("Local network permission: ${localNetworkPermission(appContext)}")
             appendLine("Notification permission: ${notificationPermission(appContext)}")
+            appendLine("Microphone permission: ${microphonePermission(appContext)}")
             appendLine("App notifications: ${appNotificationState(appContext)}")
             appendLine("Media channel: ${mediaChannelState(appContext)}")
             appendLine("Media notification active: ${mediaNotificationState(appContext)}")
@@ -179,7 +180,7 @@ object Diagnostics {
                     "write_failures=${writeFailures.get()}",
             )
             appendLine("Privacy: no TV names, network addresses, credentials, user content, tokens, or exception messages are collected.")
-            appendLine("Review note: the report includes the phone model, UTC action times, lock state, and remote button types.")
+            appendLine("Review note: the report includes the phone model, permission states, UTC action times, lock state, and remote button types.")
             appendLine()
             appendLine("Events (oldest first):")
 
@@ -325,6 +326,15 @@ object Diagnostics {
             "not_required"
         } else if (
             context.checkSelfPermission(ACCESS_LOCAL_NETWORK_PERMISSION) ==
+            PackageManager.PERMISSION_GRANTED
+        ) {
+            "granted"
+        } else {
+            "denied"
+        }
+
+    private fun microphonePermission(context: Context): String =
+        if (context.checkSelfPermission(Manifest.permission.RECORD_AUDIO) ==
             PackageManager.PERMISSION_GRANTED
         ) {
             "granted"

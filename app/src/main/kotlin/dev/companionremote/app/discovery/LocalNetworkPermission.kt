@@ -26,37 +26,3 @@ internal fun Context.hasLocalNetworkPermission(): Boolean =
         permissionGranted = checkSelfPermission(ACCESS_LOCAL_NETWORK_PERMISSION) ==
             PackageManager.PERMISSION_GRANTED,
     )
-
-internal sealed interface LocalNetworkScanAction {
-    data class RunScan(val userInitiated: Boolean) : LocalNetworkScanAction
-    data object RequestPermission : LocalNetworkScanAction
-    data object None : LocalNetworkScanAction
-}
-
-/** Keeps a permission result paired with exactly one pending scan request. */
-internal class LocalNetworkPermissionGate {
-    private var pendingUserInitiated: Boolean? = null
-
-    fun requestScan(
-        userInitiated: Boolean,
-        sdkInt: Int,
-        permissionGranted: Boolean,
-    ): LocalNetworkScanAction {
-        if (!needsLocalNetworkPermission(sdkInt, permissionGranted)) {
-            pendingUserInitiated = null
-            return LocalNetworkScanAction.RunScan(userInitiated)
-        }
-        pendingUserInitiated = userInitiated
-        return LocalNetworkScanAction.RequestPermission
-    }
-
-    fun permissionResult(granted: Boolean): LocalNetworkScanAction {
-        val userInitiated = pendingUserInitiated ?: return LocalNetworkScanAction.None
-        pendingUserInitiated = null
-        return if (granted) {
-            LocalNetworkScanAction.RunScan(userInitiated)
-        } else {
-            LocalNetworkScanAction.None
-        }
-    }
-}

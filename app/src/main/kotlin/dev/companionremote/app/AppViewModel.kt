@@ -13,6 +13,7 @@ import dev.companionremote.app.data.SettingsRepository
 import dev.companionremote.app.data.ThemeMode
 import dev.companionremote.app.discovery.AtvDiscovery
 import dev.companionremote.app.discovery.DiscoveredAtv
+import dev.companionremote.app.discovery.hasLocalNetworkPermission
 import dev.companionremote.app.diagnostics.Diagnostics
 import dev.companionremote.app.i18n.AppLanguage
 import dev.companionremote.app.i18n.AppStrings
@@ -499,6 +500,11 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
         }
     }
 
+    /** Re-evaluate native controls immediately after the entry permission dialog. */
+    fun onRuntimePermissionsChanged() {
+        startNativeControlsIfEligible()
+    }
+
     /** Release a UI-only socket when the app is no longer visible. */
     fun onBackground() {
         isForeground = false
@@ -520,6 +526,7 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
             if (homeNetworkRepository.automaticAuthorization() == null) return@launch
             if (!isForeground || !lockScreenControls.value) return@launch
             val app = getApplication<Application>()
+            if (!app.hasLocalNetworkPermission()) return@launch
             if (!RemoteControlService.notificationsEnabled(app)) return@launch
             runCatching { RemoteControlService.start(app) }
         }
