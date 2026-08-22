@@ -1649,7 +1649,6 @@ private object RemoteNotification {
             .setOnlyAlertOnce(true)
             .setShowWhen(false)
             .setLocalOnly(true)
-            .setSilent(true)
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
             builder.setForegroundServiceBehavior(Notification.FOREGROUND_SERVICE_IMMEDIATE)
         }
