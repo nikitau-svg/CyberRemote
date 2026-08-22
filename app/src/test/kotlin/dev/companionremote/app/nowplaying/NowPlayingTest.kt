@@ -40,12 +40,12 @@ class NowPlayingTest {
     }
 
     @Test
-    fun `stale or unknown state falls back to toggle`() {
+    fun `stale or unknown state uses idempotent play instead of toggle`() {
         val stale = liveSnapshot(PlaybackStatus.Playing).copy(freshness = SnapshotFreshness.Stale)
         val unknown = liveSnapshot(PlaybackStatus.Unknown)
 
-        assertEquals(PlaybackCommand.Toggle, commandFor(stale))
-        assertEquals(PlaybackCommand.Toggle, commandFor(unknown))
+        assertEquals(PlaybackCommand.Play, commandFor(stale))
+        assertEquals(PlaybackCommand.Play, commandFor(unknown))
     }
 
     @Test

@@ -97,6 +97,7 @@ class RemoteControlService : Service() {
     private val hybridHomeNetworkPolicy = HybridHomeNetworkPolicy()
     private val reconnectBackoff = BoundedReconnectBackoff()
     private val networkCallbackGate = NetworkCallbackRevalidationGate()
+    private val explicitNowPlayingRefreshPolicy = ExplicitNowPlayingRefreshPolicy()
     private var lastObservedConnectionState = ConnectionState.Disconnected
     @Volatile private var capabilityToken = UUID.randomUUID().toString()
     private var lastSnapshot = NotificationSnapshot(
@@ -270,6 +271,7 @@ class RemoteControlService : Service() {
                     immediate = true,
                     rearm = canArmWhileUnlocked,
                 )
+                requestExplicitNowPlayingRefresh()
             }
             null -> {
                 // START_STICKY is used only for an already-running foreground
@@ -989,6 +991,38 @@ class RemoteControlService : Service() {
         }
     }
 
+    /** One user-triggered refresh for an already-connected session; never a polling loop. */
+    private fun requestExplicitNowPlayingRefresh() {
+        val authorization = homeAuthorization
+        val decision = explicitNowPlayingRefreshPolicy.evaluate(
+            nowMs = SystemClock.elapsedRealtime(),
+            homeAuthorized = authorization?.isStillValid() == true &&
+                isControlLeaseActive(capabilityToken),
+            connected = session.connectionState.value == ConnectionState.Connected,
+            boundedRefreshPending = nowPlayingRefreshJob?.isActive == true,
+        )
+        Diagnostics.record(
+            this,
+            "now_playing_refresh",
+            "user_request",
+            "outcome" to DiagnosticToken(decision.name),
+        )
+        if (decision != ExplicitNowPlayingRefreshDecision.Scheduled || authorization == null) return
+
+        val leaseToken = capabilityToken
+        val networkHandle = authorization.network.networkHandle
+        nowPlayingRefreshJob = scope.launch {
+            if (
+                isControlLeaseActive(leaseToken) &&
+                homeAuthorization?.network?.networkHandle == networkHandle &&
+                authorization.isStillValid() &&
+                session.connectionState.value == ConnectionState.Connected
+            ) {
+                session.refreshNowPlaying()
+            }
+        }
+    }
+
     private fun updateMediaSession(snapshot: NotificationSnapshot) {
         val currentSession = mediaSession ?: return
         val nowPlaying = snapshot.nowPlaying
@@ -1068,9 +1102,10 @@ class RemoteControlService : Service() {
     }
 
     private fun shouldPresentMedia(snapshot: NotificationSnapshot): Boolean =
-        homeAuthorization != null &&
-            snapshot.state == ConnectionState.Connected &&
-            snapshot.nowPlaying.hasMediaSignal()
+        shouldUseMediaPresentation(
+            homeAuthorized = homeAuthorization != null,
+            connectionState = snapshot.state,
+        )
 
     private fun reconcileMediaPresentation(snapshot: NotificationSnapshot) {
         if (!shouldPresentMedia(snapshot)) {
@@ -1424,17 +1459,10 @@ private fun NowPlayingSnapshot.subtitle(): String? {
         ?: appName
 }
 
-private fun NowPlayingSnapshot.hasMediaSignal(): Boolean =
-    isAuthoritative &&
-        (
-            status != PlaybackStatus.Unknown ||
-                title != null ||
-                artist != null ||
-                seriesName != null ||
-                contentId != null ||
-                artwork != null ||
-                durationMs != null
-            )
+internal fun shouldUseMediaPresentation(
+    homeAuthorized: Boolean,
+    connectionState: ConnectionState,
+): Boolean = homeAuthorized && connectionState == ConnectionState.Connected
 
 private fun NowPlayingSnapshot.needsBoundedRefresh(): Boolean =
     !isAuthoritative ||
@@ -1552,7 +1580,6 @@ private object RemoteNotification {
         val playbackAction = when (commandFor(nowPlaying)) {
             PlaybackCommand.Play -> Triple("Play", QuickRemoteAction.Play, 111)
             PlaybackCommand.Pause -> Triple("Pause", QuickRemoteAction.Pause, 111)
-            PlaybackCommand.Toggle -> Triple("Play/Pause", QuickRemoteAction.PlayPause, 111)
         }
         val controlsUnlocked = snapshot.lockScreenControlsEnabled
         val builder = Notification.Builder(context, CHANNEL_ID)

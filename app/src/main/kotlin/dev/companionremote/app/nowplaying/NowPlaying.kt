@@ -94,15 +94,14 @@ data class NowPlayingSnapshot(
 enum class PlaybackCommand {
     Play,
     Pause,
-    Toggle,
 }
 
 /**
- * Uses explicit Play/Pause whenever MRP state is live. Toggle is deliberately
- * limited to unknown or stale state, where either explicit choice could be wrong.
+ * Never guesses with a toggle. If state is unknown or stale, explicit Play is
+ * idempotent for content that is already playing and cannot pause it by mistake.
  */
 fun commandFor(snapshot: NowPlayingSnapshot): PlaybackCommand {
-    if (!snapshot.isAuthoritative) return PlaybackCommand.Toggle
+    if (!snapshot.isAuthoritative) return PlaybackCommand.Play
     return when (snapshot.status) {
         PlaybackStatus.Playing,
         PlaybackStatus.Buffering -> PlaybackCommand.Pause
@@ -111,7 +110,7 @@ fun commandFor(snapshot: NowPlayingSnapshot): PlaybackCommand {
         PlaybackStatus.Idle,
         PlaybackStatus.Stopped -> PlaybackCommand.Play
 
-        PlaybackStatus.Unknown -> PlaybackCommand.Toggle
+        PlaybackStatus.Unknown -> PlaybackCommand.Play
     }
 }
 
@@ -130,7 +129,6 @@ data class PendingPlaybackCommand(
         return when (command) {
             PlaybackCommand.Play -> snapshot.status == PlaybackStatus.Playing
             PlaybackCommand.Pause -> snapshot.status == PlaybackStatus.Paused
-            PlaybackCommand.Toggle -> snapshot.status != PlaybackStatus.Unknown
         }
     }
 }

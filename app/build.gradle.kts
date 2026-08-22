@@ -14,8 +14,8 @@ android {
         applicationId = "dev.companionremote.nikita"
         minSdk = 26
         targetSdk = 35
-        versionCode = 13
-        versionName = "1.3.5-hybrid-home-lifecycle"
+        versionCode = 14
+        versionName = "1.3.6-media-transition"
     }
 
     buildTypes {
