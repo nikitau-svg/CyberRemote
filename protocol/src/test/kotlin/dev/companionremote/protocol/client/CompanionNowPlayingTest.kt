@@ -120,6 +120,37 @@ class CompanionNowPlayingTest {
         assertEquals("episode-2", merged.contentId)
     }
 
+    @Test
+    fun `explicit no-media update clears stale playback and metadata`() {
+        val playing = parse(
+            linkedMapOf(
+                "playbackRate" to 1.0,
+                "contentIdentifier" to "episode-1",
+                "episodeTitle" to "Pilot",
+            ),
+            capturedAtNanos = 10,
+        )
+        val noMedia = parse(
+            linkedMapOf(
+                "playbackRate" to null,
+                "playbackState" to null,
+                "metadata" to null,
+                "imageData" to null,
+                "identifier" to null,
+                "playerIdentifier" to null,
+            ),
+            capturedAtNanos = 20,
+        )
+
+        val merged = noMedia.withMissingFieldsFrom(playing)
+
+        assertEquals(CompanionPlaybackState.Unknown, merged.playbackState)
+        assertNull(merged.playbackRate)
+        assertNull(merged.title)
+        assertNull(merged.contentId)
+        assertTrue(merged.explicitlyCleared)
+    }
+
     private fun parse(properties: Map<String, Any?>, capturedAtNanos: Long): CompanionNowPlayingInfo =
         requireNotNull(
             CompanionNowPlayingParser.parse(

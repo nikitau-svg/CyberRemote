@@ -29,6 +29,7 @@ data class CompanionNowPlayingInfo(
     val artworkData: ByteArray?,
     val artworkId: String?,
     val capturedAtNanos: Long,
+    internal val explicitlyCleared: Boolean = false,
 ) {
     override fun equals(other: Any?): Boolean =
         other is CompanionNowPlayingInfo &&
@@ -45,7 +46,8 @@ data class CompanionNowPlayingInfo(
             artworkUrlTemplate == other.artworkUrlTemplate &&
             artworkData.contentEqualsNullable(other.artworkData) &&
             artworkId == other.artworkId &&
-            capturedAtNanos == other.capturedAtNanos
+            capturedAtNanos == other.capturedAtNanos &&
+            explicitlyCleared == other.explicitlyCleared
 
     override fun hashCode(): Int {
         var result = playbackState.hashCode()
@@ -62,6 +64,7 @@ data class CompanionNowPlayingInfo(
         result = 31 * result + (artworkData?.contentHashCode() ?: 0)
         result = 31 * result + (artworkId?.hashCode() ?: 0)
         result = 31 * result + capturedAtNanos.hashCode()
+        result = 31 * result + explicitlyCleared.hashCode()
         return result
     }
 }
@@ -76,7 +79,13 @@ data class CompanionNowPlayingInfo(
 internal fun CompanionNowPlayingInfo.withMissingFieldsFrom(
     previous: CompanionNowPlayingInfo?,
 ): CompanionNowPlayingInfo {
-    if (previous == null || (contentId != null && contentId != previous.contentId)) return this
+    if (
+        previous == null ||
+        explicitlyCleared ||
+        (contentId != null && contentId != previous.contentId)
+    ) {
+        return this
+    }
     return copy(
         playbackState = if (playbackState == CompanionPlaybackState.Unknown) {
             previous.playbackState
@@ -114,6 +123,7 @@ internal object CompanionNowPlayingParser {
         val artworkData = root.bytes("imageData", "artworkData", "artwork")
         val contentId = root.text("contentIdentifier", "contentID", "showID", "mediaID")
         val artworkId = artworkUrl?.let(::sha256) ?: artworkData?.let(::sha256)
+        val explicitlyCleared = root.isExplicitNowPlayingClear()
 
         return CompanionNowPlayingInfo(
             playbackState = when {
@@ -135,8 +145,22 @@ internal object CompanionNowPlayingParser {
             artworkData = artworkData,
             artworkId = artworkId,
             capturedAtNanos = capturedAtNanos,
+            explicitlyCleared = explicitlyCleared,
         )
     }
+
+    /**
+     * A no-media tvOS event contains the whole NowPlayingInfo envelope with
+     * explicit nulls. This is distinct from a partial metadata event where
+     * transport fields are simply absent and must be merged with prior state.
+     */
+    private fun Any?.isExplicitNowPlayingClear(): Boolean =
+        hasExplicitNull("playbackRate") &&
+            hasExplicitNull("playbackState") &&
+            hasExplicitNull("metadata") &&
+            hasExplicitNull("imageData") &&
+            hasExplicitNull("identifier") &&
+            hasExplicitNull("playerIdentifier")
 
     private fun Any?.text(vararg names: String): String? =
         deepValue(names.toSet()) as? String
@@ -172,6 +196,28 @@ internal object CompanionNowPlayingParser {
                 }
             }
             return null
+        }
+
+        return visit(this)
+    }
+
+    private fun Any?.hasExplicitNull(vararg names: String): Boolean {
+        val wanted = names.map { it.lowercase() }.toSet()
+        val visited = java.util.Collections.newSetFromMap(java.util.IdentityHashMap<Any, Boolean>())
+
+        fun visit(node: Any?): Boolean = when (node) {
+            is Map<*, *> -> {
+                if (!visited.add(node)) {
+                    false
+                } else {
+                    node.entries.any { (key, value) ->
+                        val normalizedKey = (key as? String)?.lowercase()
+                        normalizedKey != null && normalizedKey in wanted && value == null
+                    } || node.values.any(::visit)
+                }
+            }
+            is List<*> -> visited.add(node) && node.any(::visit)
+            else -> false
         }
 
         return visit(this)
