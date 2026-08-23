@@ -79,4 +79,33 @@ class LanCallbackReducerTest {
         assertEquals(LanAuthorizationCommit.Stable, gate.commitAuthorization(1L))
         assertEquals(LanAuthorizationCommit.Handover, gate.commitAuthorization(2L))
     }
+
+    @Test
+    fun `successor can be authorized before stale loss of the old handle`() {
+        val gate = NetworkCallbackRevalidationGate()
+        gate.commitAuthorization(1L)
+
+        assertEquals(LanCallbackAction.Ignore, gate.onAvailable(2L))
+        assertEquals(LanCallbackAction.Ignore, gate.onCapabilitiesChanged(2L, eligibleCaps))
+        assertEquals(LanCallbackAction.Revalidate, gate.onLinkPropertiesChanged(2L, homeLinks))
+        assertEquals(LanAuthorizationCommit.Handover, gate.commitAuthorization(2L))
+
+        // Android may deliver the old Network's onLost after the successor has
+        // already passed strict/HAP-backed authorization. It must not tear down
+        // the newly committed Network.
+        assertEquals(LanCallbackAction.Ignore, gate.onLost(1L))
+    }
+
+    @Test
+    fun `same handle link properties churn revalidates without inventing a handover`() {
+        val gate = NetworkCallbackRevalidationGate()
+        gate.onCapabilitiesChanged(1L, eligibleCaps)
+        gate.onLinkPropertiesChanged(1L, homeLinks)
+        gate.commitAuthorization(1L)
+
+        val changed = homeLinks.copy(dnsServers = setOf("4:08080808"))
+        assertEquals(LanCallbackAction.Revalidate, gate.onLinkPropertiesChanged(1L, changed))
+        assertEquals(LanAuthorizationCommit.Stable, gate.commitAuthorization(1L))
+        assertEquals(LanCallbackAction.Ignore, gate.onLinkPropertiesChanged(1L, changed))
+    }
 }

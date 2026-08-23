@@ -88,4 +88,102 @@ class MediaPresentationPolicyTest {
             ),
         )
     }
+
+    @Test
+    fun `connected media presentation survives the bounded departure grace`() {
+        assertTrue(
+            shouldUseMediaPresentation(
+                homeAuthorized = true,
+                connectionState = ConnectionState.Disconnected,
+                retainedDuringNetworkTransition = true,
+            ),
+        )
+    }
+
+    @Test
+    fun `retained snapshot cannot expose media controls without home authorization`() {
+        assertFalse(
+            shouldUseMediaPresentation(
+                homeAuthorized = false,
+                connectionState = ConnectionState.Connected,
+                retainedDuringNetworkTransition = true,
+            ),
+        )
+    }
+
+    @Test
+    fun `stale connected emission cannot release retained media after a handover`() {
+        assertFalse(
+            shouldReleaseRetainedMedia(
+                departureSuspected = false,
+                requiresReconnect = true,
+                sawConnectionBreak = false,
+                retainedObservedAtElapsedMs = 1_000L,
+                currentConnectionState = ConnectionState.Connected,
+                currentAuthoritative = true,
+                currentObservedAtElapsedMs = 1_001L,
+            ),
+        )
+        assertFalse(
+            shouldReleaseRetainedMedia(
+                departureSuspected = false,
+                requiresReconnect = true,
+                sawConnectionBreak = true,
+                retainedObservedAtElapsedMs = 1_000L,
+                currentConnectionState = ConnectionState.Connected,
+                currentAuthoritative = true,
+                currentObservedAtElapsedMs = 1_000L,
+            ),
+        )
+    }
+
+    @Test
+    fun `fresh authoritative state releases retained media after the required edge`() {
+        assertTrue(
+            shouldReleaseRetainedMedia(
+                departureSuspected = false,
+                requiresReconnect = true,
+                sawConnectionBreak = true,
+                retainedObservedAtElapsedMs = 1_000L,
+                currentConnectionState = ConnectionState.Connected,
+                currentAuthoritative = true,
+                currentObservedAtElapsedMs = 1_001L,
+            ),
+        )
+        assertTrue(
+            shouldReleaseRetainedMedia(
+                departureSuspected = false,
+                requiresReconnect = false,
+                sawConnectionBreak = false,
+                retainedObservedAtElapsedMs = 1_000L,
+                currentConnectionState = ConnectionState.Connected,
+                currentAuthoritative = true,
+                currentObservedAtElapsedMs = 1_001L,
+            ),
+        )
+    }
+
+    @Test
+    fun `second handover requires a new connection edge before stale media can release`() {
+        val gate = RetainedMediaReconnectGate()
+        gate.observe(ConnectionState.Disconnected)
+        assertTrue(gate.sawConnectionBreak)
+
+        gate.rearm()
+        assertFalse(gate.sawConnectionBreak)
+        assertFalse(
+            shouldReleaseRetainedMedia(
+                departureSuspected = false,
+                requiresReconnect = true,
+                sawConnectionBreak = gate.sawConnectionBreak,
+                retainedObservedAtElapsedMs = 1_000L,
+                currentConnectionState = ConnectionState.Connected,
+                currentAuthoritative = true,
+                currentObservedAtElapsedMs = 1_001L,
+            ),
+        )
+
+        gate.observe(ConnectionState.Connecting)
+        assertTrue(gate.sawConnectionBreak)
+    }
 }

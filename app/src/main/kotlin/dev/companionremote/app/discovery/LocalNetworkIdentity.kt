@@ -14,6 +14,7 @@ import java.util.Base64
 /** An opaque, per-install identity for the currently attached physical LAN. */
 internal data class LocalNetworkSnapshot(
     val fingerprint: String,
+    val continuityFingerprints: Set<String>,
     val network: Network,
 ) {
     val networkHandle: Long get() = network.networkHandle
@@ -28,6 +29,8 @@ internal data class NetworkFingerprintMaterial(
     val prefixes: Set<String>,
     val gateways: Set<String>,
     val dnsServers: Set<String>,
+    /** Includes IPv6 link-local default gateways, which strict v1 intentionally excludes. */
+    val continuityGateways: Set<String> = gateways,
 ) {
     fun canonicalBytes(): ByteArray? {
         if (transports.isEmpty() || prefixes.isEmpty()) return null
@@ -55,6 +58,21 @@ internal object PrivateIdentityFingerprint {
     fun network(material: NetworkFingerprintMaterial, signer: (ByteArray) -> ByteArray): String? =
         material.canonicalBytes()?.let { fingerprint("network-v1", it, signer) }
 
+    /**
+     * Produces bounded, independently keyed continuity hints for transient Android Network
+     * replacement. A hint deliberately covers only one transport and one address family at a
+     * time. Only a same-family default gateway is accepted as an anchor.
+     *
+     * These hints are less strict than [network] and must never authorize cached LAN access.
+     */
+    fun networkContinuity(
+        material: NetworkFingerprintMaterial,
+        signer: (ByteArray) -> ByteArray,
+    ): Set<String> = material.continuityCanonicalBytes()
+        .mapTo(linkedSetOf()) { payload ->
+            fingerprint("network-continuity-v2", payload, signer)
+        }
+
     fun device(deviceIdentifier: ByteArray, signer: (ByteArray) -> ByteArray): String? {
         if (deviceIdentifier.isEmpty()) return null
         return fingerprint("apple-tv-hap-id-v1", deviceIdentifier, signer)
@@ -73,6 +91,40 @@ internal object PrivateIdentityFingerprint {
     }
 }
 
+private const val MAX_CONTINUITY_FINGERPRINTS = 16
+
+/**
+ * Canonical continuity inputs contain no more than one prefix and one same-family anchor.
+ * Splitting them this way lets an unchanged IPv4 path survive unrelated IPv6 or DNS churn.
+ */
+private fun NetworkFingerprintMaterial.continuityCanonicalBytes(): List<ByteArray> {
+    if (transports.isEmpty() || prefixes.isEmpty()) return emptyList()
+    return sequence {
+        for (transport in transports.asSequence().filter(String::isNotBlank).sorted()) {
+            for (family in listOf("4", "6")) {
+                val familyPrefixes = prefixes.filterFamily(family)
+                val familyGateways = continuityGateways.filterFamily(family)
+                for (prefix in familyPrefixes) {
+                    for (gateway in familyGateways) {
+                        yield(
+                            buildString {
+                                append("network-continuity-v2\n")
+                                append("transport=").append(transport).append('\n')
+                                append("family=").append(family).append('\n')
+                                append("prefix=").append(prefix).append('\n')
+                                append("gateway=").append(gateway).append('\n')
+                            }.toByteArray(Charsets.UTF_8),
+                        )
+                    }
+                }
+            }
+        }
+    }.take(MAX_CONTINUITY_FINGERPRINTS).toList()
+}
+
+private fun Set<String>.filterFamily(family: String): List<String> =
+    asSequence().filter { it.startsWith("$family:") }.sorted().toList()
+
 /**
  * Reads only LinkProperties/NetworkCapabilities. SSID, BSSID and location
  * APIs are intentionally not used.
@@ -90,11 +142,31 @@ internal class LocalNetworkIdentity(context: Context) {
 
     /** Find the bound LAN even when Android exposes multiple physical Networks. */
     fun matching(expectedFingerprint: String): LocalNetworkSnapshot? {
+        return matchingAny(setOf(expectedFingerprint))
+    }
+
+    /** Strictly match one of a bounded set of previously HAP-verified exact LAN variants. */
+    fun matchingAny(expectedFingerprints: Set<String>): LocalNetworkSnapshot? {
         if (!appContext.hasLocalNetworkPermission()) return null
+        if (expectedFingerprints.isEmpty()) return null
         return physicalNetworks()
             .asSequence()
             .mapNotNull(::snapshot)
-            .firstOrNull { it.fingerprint == expectedFingerprint }
+            .firstOrNull { it.fingerprint in expectedFingerprints }
+    }
+
+    /**
+     * Finds a possible continuation of a previously strict-matched LAN. The caller receives only
+     * a candidate Network; this method is intentionally separate from authorization.
+     */
+    fun matchingContinuity(expectedFingerprints: Set<String>): LocalNetworkSnapshot? {
+        if (!appContext.hasLocalNetworkPermission() || expectedFingerprints.isEmpty()) return null
+        return physicalNetworks()
+            .asSequence()
+            .mapNotNull(::snapshot)
+            .firstOrNull { snapshot ->
+                snapshot.continuityFingerprints.any(expectedFingerprints::contains)
+            }
     }
 
     /** Recomputes every fingerprint input for this exact Android Network. */
@@ -107,7 +179,10 @@ internal class LocalNetworkIdentity(context: Context) {
         val fingerprint = runCatching {
             PrivateIdentityFingerprint.network(material, KeystoreHmac::sign)
         }.getOrNull() ?: return null
-        return LocalNetworkSnapshot(fingerprint, network)
+        val continuityFingerprints = runCatching {
+            PrivateIdentityFingerprint.networkContinuity(material, KeystoreHmac::sign)
+        }.getOrDefault(emptySet())
+        return LocalNetworkSnapshot(fingerprint, continuityFingerprints, network)
     }
 
     fun deviceFingerprint(deviceIdentifier: ByteArray): String? =
@@ -155,10 +230,25 @@ internal class LocalNetworkIdentity(context: Context) {
             if (!route.isDefaultRoute) return@mapNotNullTo null
             route.gateway?.takeIf { it.isUsableLanAddress() }?.let { addressToken(it) }
         }
+        val continuityGateways = routes.mapNotNullTo(mutableSetOf()) { route ->
+            if (!route.isDefaultRoute) return@mapNotNullTo null
+            route.gateway
+                ?.takeIf { address ->
+                    address.isUsableLanAddress() ||
+                        (address is Inet6Address && address.isLinkLocalAddress)
+                }
+                ?.let { addressToken(it) }
+        }
         val dns = dnsServers.mapNotNullTo(mutableSetOf()) { address ->
             address.takeIf { it.isUsableLanAddress() }?.let { addressToken(it) }
         }
-        return NetworkFingerprintMaterial(transports, prefixes, gateways, dns)
+        return NetworkFingerprintMaterial(
+            transports = transports,
+            prefixes = prefixes,
+            gateways = gateways,
+            dnsServers = dns,
+            continuityGateways = continuityGateways,
+        )
     }
 
     private fun InetAddress.isUsableLanAddress(): Boolean =

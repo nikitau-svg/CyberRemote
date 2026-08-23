@@ -6,7 +6,7 @@ import org.junit.jupiter.api.Test
 
 class HybridHomeNetworkPolicyTest {
     @Test
-    fun `departure has two second grace then five minute watcher timeout`() {
+    fun `departure has fifteen second grace then five minute watcher timeout`() {
         val policy = HybridHomeNetworkPolicy()
 
         assertTransition(
@@ -16,26 +16,26 @@ class HybridHomeNetworkPolicyTest {
         assertTransition(
             policy.observe(authorized = false, nowMs = 1_000L),
             HybridHomeNetworkPhase.DepartureGrace,
-            nextEvaluationAtMs = 3_000L,
+            nextEvaluationAtMs = 16_000L,
         )
         assertTransition(
-            policy.onDeadline(nowMs = 2_999L),
+            policy.onDeadline(nowMs = 15_999L),
             HybridHomeNetworkPhase.DepartureGrace,
-            nextEvaluationAtMs = 3_000L,
+            nextEvaluationAtMs = 16_000L,
         )
         assertTransition(
-            policy.onDeadline(nowMs = 3_000L),
+            policy.onDeadline(nowMs = 16_000L),
             HybridHomeNetworkPhase.AwayWatching,
             HybridHomeNetworkEdgeAction.DepartureConfirmed,
-            nextEvaluationAtMs = 303_000L,
+            nextEvaluationAtMs = 316_000L,
         )
         assertTransition(
-            policy.onDeadline(nowMs = 302_999L),
+            policy.onDeadline(nowMs = 315_999L),
             HybridHomeNetworkPhase.AwayWatching,
-            nextEvaluationAtMs = 303_000L,
+            nextEvaluationAtMs = 316_000L,
         )
         assertTransition(
-            policy.onDeadline(nowMs = 303_000L),
+            policy.onDeadline(nowMs = 316_000L),
             HybridHomeNetworkPhase.Stopped,
             HybridHomeNetworkEdgeAction.StopService,
         )
@@ -62,6 +62,20 @@ class HybridHomeNetworkPolicyTest {
         assertTransition(
             policy.onDeadline(nowMs = 2_100L),
             HybridHomeNetworkPhase.Home,
+        )
+    }
+
+    @Test
+    fun `observed Samsung successor delay remains inside default grace`() {
+        val policy = HybridHomeNetworkPolicy()
+
+        policy.observe(authorized = true, nowMs = 0L)
+        policy.observe(authorized = false, nowMs = 100L)
+
+        assertTransition(
+            policy.observe(authorized = true, nowMs = 12_538L),
+            HybridHomeNetworkPhase.Home,
+            HybridHomeNetworkEdgeAction.ReturnedHome,
         )
     }
 
@@ -127,26 +141,26 @@ class HybridHomeNetworkPolicyTest {
         assertTransition(
             policy.observe(authorized = false, nowMs = 10_000L),
             HybridHomeNetworkPhase.DepartureGrace,
-            nextEvaluationAtMs = 12_000L,
+            nextEvaluationAtMs = 25_000L,
         )
         assertTransition(
-            policy.observe(authorized = false, nowMs = 11_999L),
+            policy.observe(authorized = false, nowMs = 24_999L),
             HybridHomeNetworkPhase.DepartureGrace,
-            nextEvaluationAtMs = 12_000L,
+            nextEvaluationAtMs = 25_000L,
         )
         assertTransition(
-            policy.onDeadline(nowMs = 12_000L),
+            policy.onDeadline(nowMs = 25_000L),
             HybridHomeNetworkPhase.AwayWatching,
             HybridHomeNetworkEdgeAction.DepartureConfirmed,
-            nextEvaluationAtMs = 312_000L,
+            nextEvaluationAtMs = 325_000L,
         )
         assertTransition(
             policy.observe(authorized = false, nowMs = 100_000L),
             HybridHomeNetworkPhase.AwayWatching,
-            nextEvaluationAtMs = 312_000L,
+            nextEvaluationAtMs = 325_000L,
         )
         assertTransition(
-            policy.onDeadline(nowMs = 312_000L),
+            policy.onDeadline(nowMs = 325_000L),
             HybridHomeNetworkPhase.Stopped,
             HybridHomeNetworkEdgeAction.StopService,
         )
@@ -169,12 +183,12 @@ class HybridHomeNetworkPolicyTest {
         assertTransition(
             policy.observe(authorized = false, nowMs = 1_500L),
             HybridHomeNetworkPhase.DepartureGrace,
-            nextEvaluationAtMs = 3_500L,
+            nextEvaluationAtMs = 16_500L,
         )
         assertTransition(
             policy.onDeadline(nowMs = 2_000L),
             HybridHomeNetworkPhase.DepartureGrace,
-            nextEvaluationAtMs = 3_500L,
+            nextEvaluationAtMs = 16_500L,
         )
     }
 

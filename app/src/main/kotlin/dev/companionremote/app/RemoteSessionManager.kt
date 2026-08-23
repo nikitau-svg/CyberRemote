@@ -6,6 +6,7 @@ import android.content.Context
 import android.os.SystemClock
 import android.service.quicksettings.TileService
 import dev.companionremote.app.data.CredentialsRepository
+import dev.companionremote.app.data.HomeNetworkAuthorization
 import dev.companionremote.app.data.HomeNetworkRepository
 import dev.companionremote.app.data.SettingsRepository
 import dev.companionremote.app.discovery.AtvDiscovery
@@ -28,6 +29,7 @@ import dev.companionremote.protocol.client.KeyboardFocusState
 import dev.companionremote.protocol.client.TouchPhase
 import dev.companionremote.protocol.companion.CompanionConnection
 import dev.companionremote.protocol.hap.HapCredentials
+import dev.companionremote.protocol.hap.PairVerify
 import dev.companionremote.protocol.transport.SocketTransport
 import java.io.IOException
 import java.net.ConnectException
@@ -69,6 +71,8 @@ class RemoteSessionManager private constructor(context: Context) {
     private val keyguard = appContext.getSystemService(KeyguardManager::class.java)
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
     private val sessionMutex = Mutex()
+    /** Serializes HAP continuity proofs without blocking the live session state machine. */
+    private val continuityMutex = Mutex()
     private val lockedRateLimiter = LockedRemoteRateLimiter { SystemClock.elapsedRealtime() }
 
     private var client: CompanionClient? = null
@@ -215,6 +219,82 @@ class RemoteSessionManager private constructor(context: Context) {
         } else {
             connected
         }
+    }
+
+    /**
+     * Recover only an in-process home-LAN handover. A continuity fingerprint
+     * is deliberately not authorization: the cached/resolved endpoint must
+     * first prove the stored Apple TV HAP identity. Nothing is published as a
+     * connected session and no command can run before promotion succeeds.
+     */
+    internal suspend fun recoverHomeNetworkContinuity(
+        origin: HomeNetworkAuthorization,
+        stillAllowed: () -> Boolean,
+    ): HomeNetworkAuthorization? = continuityMutex.withLock {
+        if (!stillAllowed()) return@withLock null
+        val candidate = homeNetworkRepository.continuityCandidate(origin)
+            ?: return@withLock continuityRecoveryResult("no_candidate")
+        val cachedDevice = homeNetworkRepository.continuityDevice(candidate)
+        val stored = credentialsRepository.load(cachedDevice.name)
+            ?: return@withLock continuityRecoveryResult("credentials_unavailable")
+        val parsed = runCatching { HapCredentials.parse(stored) }.getOrNull()
+            ?: return@withLock continuityRecoveryResult("credentials_invalid")
+        if (!homeNetworkRepository.continuityDeviceMatches(candidate, parsed.atvId)) {
+            return@withLock continuityRecoveryResult("device_mismatch")
+        }
+
+        Diagnostics.record(appContext, "home_network", "continuity_verify_attempt")
+        val candidateStillAllowed = {
+            stillAllowed() && candidate.isStillCandidate()
+        }
+        if (!candidateStillAllowed()) {
+            return@withLock continuityRecoveryResult("candidate_stale")
+        }
+
+        var verifiedDevice = cachedDevice.takeIf { device ->
+            verifyContinuityDevice(device, candidate.network.socketFactory, parsed, candidateStillAllowed)
+        }
+        if (verifiedDevice == null && candidateStillAllowed()) {
+            val resolved = discovery.resolveByName(
+                name = cachedDevice.name,
+                timeoutMs = CONTINUITY_DISCOVERY_TIMEOUT_MS,
+                network = candidate.network,
+                authorizationStillValid = candidateStillAllowed,
+            )
+            // A first connect can fail transiently while Android is finishing
+            // the handover. Even when mDNS resolves to the same host/port,
+            // retry PairVerify once against that freshly resolved service.
+            if (resolved != null && candidateStillAllowed()) {
+                verifiedDevice = resolved.takeIf { device ->
+                    verifyContinuityDevice(
+                        device,
+                        candidate.network.socketFactory,
+                        parsed,
+                        candidateStillAllowed,
+                    )
+                }
+            }
+        }
+        if (verifiedDevice == null || !candidateStillAllowed()) {
+            return@withLock continuityRecoveryResult("verify_failed")
+        }
+
+        val authorization = homeNetworkRepository.promoteAfterHapPairVerify(
+            candidate = candidate,
+            deviceIdentifier = parsed.atvId,
+            verifiedDevice = verifiedDevice,
+        ) ?: return@withLock continuityRecoveryResult("promotion_rejected")
+        if (!stillAllowed() || !authorization.isStillValid()) {
+            return@withLock continuityRecoveryResult("authorization_stale")
+        }
+        Diagnostics.record(
+            appContext,
+            "home_network",
+            "continuity_verify_result",
+            "success" to true,
+            "outcome" to DiagnosticToken("verified"),
+        )
+        authorization
     }
 
     suspend fun reconnect(): Boolean = sessionMutex.withLock {
@@ -581,6 +661,54 @@ class RemoteSessionManager private constructor(context: Context) {
         connection.await()
     }
 
+    private suspend fun verifyContinuityDevice(
+        device: DiscoveredAtv,
+        socketFactory: javax.net.SocketFactory,
+        credentials: HapCredentials,
+        stillAllowed: () -> Boolean,
+    ): Boolean {
+        var connection: CompanionConnection? = null
+        return try {
+            withTimeout(CONTINUITY_PAIR_VERIFY_TIMEOUT_MS) {
+                if (!stillAllowed()) return@withTimeout false
+                val transport = SocketTransport.connect(
+                    host = device.host,
+                    port = device.port,
+                    timeoutMs = CONTINUITY_SOCKET_TIMEOUT_MS,
+                    socketFactory = socketFactory,
+                )
+                if (!stillAllowed()) {
+                    transport.close()
+                    return@withTimeout false
+                }
+                val current = CompanionConnection(transport)
+                connection = current
+                current.start()
+                PairVerify(current, credentials).verify()
+                stillAllowed()
+            }
+        } catch (_: TimeoutCancellationException) {
+            false
+        } catch (error: CancellationException) {
+            throw error
+        } catch (_: Exception) {
+            false
+        } finally {
+            runCatching { connection?.close() }
+        }
+    }
+
+    private fun continuityRecoveryResult(outcome: String): HomeNetworkAuthorization? {
+        Diagnostics.record(
+            appContext,
+            "home_network",
+            "continuity_verify_result",
+            "success" to false,
+            "outcome" to DiagnosticToken(outcome),
+        )
+        return null
+    }
+
     private fun observeKeyboard(newClient: CompanionClient) {
         keyboardJob?.cancel()
         keyboardJob = scope.launch {
@@ -684,6 +812,11 @@ class RemoteSessionManager private constructor(context: Context) {
                     withTimeoutOrNull(DISCONNECT_TIMEOUT_MS) { current.disconnect() }
                 } catch (e: CancellationException) {
                     runCatching { current.close() }
+                    // client/now-playing were already cleared above. Publish
+                    // the matching connection state before propagating
+                    // cancellation so a handover callback cannot leave the
+                    // manager reporting Connected with no live client.
+                    _connectionState.value = ConnectionState.Disconnected
                     throw e
                 } catch (_: Exception) {
                     // A best-effort protocol close failed; force-close below.
@@ -722,6 +855,9 @@ class RemoteSessionManager private constructor(context: Context) {
         private const val RECONNECT_DELAY_MS = 500L
         private const val CONNECT_TIMEOUT_MS = 2_500
         private const val SESSION_TIMEOUT_MS = 15_000L
+        private const val CONTINUITY_DISCOVERY_TIMEOUT_MS = 4_000L
+        private const val CONTINUITY_SOCKET_TIMEOUT_MS = 2_500
+        private const val CONTINUITY_PAIR_VERIFY_TIMEOUT_MS = 5_000L
         private const val COMMAND_TIMEOUT_MS = 10_000L
         private const val NOW_PLAYING_REFRESH_TIMEOUT_MS = 2_000L
         private const val DISCONNECT_TIMEOUT_MS = 2_000L

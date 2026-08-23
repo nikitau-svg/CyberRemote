@@ -7,6 +7,7 @@ import org.junit.jupiter.api.Assertions.assertEquals
 import org.junit.jupiter.api.Assertions.assertNotEquals
 import org.junit.jupiter.api.Assertions.assertNotNull
 import org.junit.jupiter.api.Assertions.assertNull
+import org.junit.jupiter.api.Assertions.assertTrue
 import org.junit.jupiter.api.Test
 
 class LocalNetworkIdentityTest {
@@ -85,6 +86,142 @@ class LocalNetworkIdentityTest {
             signer,
         )
         assertNotEquals(device, network)
+    }
+
+    @Test
+    fun `continuity anchor survives DNS churn while strict v1 remains strict`() {
+        val first = material(gateway = "4:c0a83201")
+        val changedDns = first.copy(dnsServers = setOf("4:09090909"))
+
+        assertNotEquals(
+            PrivateIdentityFingerprint.network(first, signer),
+            PrivateIdentityFingerprint.network(changedDns, signer),
+        )
+        assertEquals(
+            PrivateIdentityFingerprint.networkContinuity(first, signer),
+            PrivateIdentityFingerprint.networkContinuity(changedDns, signer),
+        )
+    }
+
+    @Test
+    fun `stable IPv4 continuity survives unrelated IPv6 addition`() {
+        val ipv4Only = material(gateway = "4:c0a83201")
+        val dualStack = ipv4Only.copy(
+            prefixes = ipv4Only.prefixes + "6:fd000000000000000000000000000000/64",
+            gateways = ipv4Only.gateways + "6:fd000000000000000000000000000001",
+            continuityGateways = ipv4Only.continuityGateways +
+                "6:fe800000000000000000000000000001",
+        )
+        val before = PrivateIdentityFingerprint.networkContinuity(ipv4Only, signer)
+        val after = PrivateIdentityFingerprint.networkContinuity(dualStack, signer)
+
+        assertTrue(before.intersect(after).isNotEmpty())
+        assertNotEquals(
+            PrivateIdentityFingerprint.network(ipv4Only, signer),
+            PrivateIdentityFingerprint.network(dualStack, signer),
+        )
+    }
+
+    @Test
+    fun `different prefix or gateway has no continuity intersection`() {
+        val home = material(gateway = "4:c0a83201")
+        val changedGateway = home.copy(
+            gateways = setOf("4:c0a832fe"),
+            continuityGateways = setOf("4:c0a832fe"),
+        )
+        val changedPrefix = home.copy(prefixes = setOf("4:c0a83300/24"))
+        val expected = PrivateIdentityFingerprint.networkContinuity(home, signer)
+
+        assertTrue(
+            expected.intersect(
+                PrivateIdentityFingerprint.networkContinuity(changedGateway, signer),
+            ).isEmpty(),
+        )
+        assertTrue(
+            expected.intersect(
+                PrivateIdentityFingerprint.networkContinuity(changedPrefix, signer),
+            ).isEmpty(),
+        )
+    }
+
+    @Test
+    fun `continuity requires a same-family prefix and gateway`() {
+        val crossFamilyOnly = material(gateway = "4:c0a83201").copy(
+            continuityGateways = setOf("6:fe800000000000000000000000000001"),
+        )
+
+        assertTrue(
+            PrivateIdentityFingerprint.networkContinuity(crossFamilyOnly, signer).isEmpty(),
+        )
+    }
+
+    @Test
+    fun `continuity has no DNS fallback`() {
+        val dnsOnly = material(gateway = "4:c0a83201").copy(
+            gateways = emptySet(),
+            continuityGateways = emptySet(),
+            dnsServers = setOf("4:01010101"),
+        )
+
+        assertNotNull(PrivateIdentityFingerprint.network(dnsOnly, signer))
+        assertTrue(PrivateIdentityFingerprint.networkContinuity(dnsOnly, signer).isEmpty())
+    }
+
+    @Test
+    fun `IPv6 link-local gateway can anchor continuity without changing strict v1`() {
+        val strictMaterial = NetworkFingerprintMaterial(
+            transports = setOf("wifi"),
+            prefixes = setOf("6:fd000000000000000000000000000000/64"),
+            gateways = emptySet(),
+            dnsServers = setOf("6:20014860486000000000000000008888"),
+        )
+        val withLinkLocalContinuity = strictMaterial.copy(
+            continuityGateways = setOf("6:fe800000000000000000000000000001"),
+        )
+
+        assertEquals(
+            PrivateIdentityFingerprint.network(strictMaterial, signer),
+            PrivateIdentityFingerprint.network(withLinkLocalContinuity, signer),
+        )
+        assertTrue(
+            PrivateIdentityFingerprint.networkContinuity(strictMaterial, signer).isEmpty(),
+        )
+        assertTrue(
+            PrivateIdentityFingerprint.networkContinuity(
+                withLinkLocalContinuity,
+                signer,
+            ).isNotEmpty(),
+        )
+    }
+
+    @Test
+    fun `continuity generation stays bounded for pathological link properties`() {
+        val prefixes = (0 until 256).mapTo(linkedSetOf()) { index ->
+            "4:${index.toString(16).padStart(8, '0')}/24"
+        }
+        val gateways = (0 until 256).mapTo(linkedSetOf()) { index ->
+            "4:${(index + 0x10000).toString(16).padStart(8, '0')}"
+        }
+        val material = NetworkFingerprintMaterial(
+            transports = linkedSetOf("wifi", "ethernet"),
+            prefixes = prefixes,
+            gateways = gateways,
+            dnsServers = emptySet(),
+        )
+
+        val fingerprints = PrivateIdentityFingerprint.networkContinuity(material, signer)
+        val reordered = PrivateIdentityFingerprint.networkContinuity(
+            material.copy(
+                transports = material.transports.reversed().toSet(),
+                prefixes = material.prefixes.reversed().toSet(),
+                gateways = material.gateways.reversed().toSet(),
+                continuityGateways = material.continuityGateways.reversed().toSet(),
+            ),
+            signer,
+        )
+
+        assertEquals(16, fingerprints.size)
+        assertEquals(fingerprints, reordered)
     }
 
     @Test

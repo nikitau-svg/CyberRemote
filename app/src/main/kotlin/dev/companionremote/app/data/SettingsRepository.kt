@@ -189,6 +189,32 @@ class SettingsRepository(context: Context) {
         }
     }
 
+    /**
+     * Replace a binding only if it is still the value that the caller verified.
+     * This prevents a delayed network-handover proof from overwriting a newer
+     * user pairing or forget/rebind action.
+     */
+    suspend fun replaceHomeNetworkBindingIf(
+        expected: HomeNetworkBinding,
+        replacement: HomeNetworkBinding,
+    ): Boolean {
+        val wrapped = KeystoreCrypto.encrypt(HomeNetworkBindingCodec.encode(replacement))
+        var replaced = false
+        appContext.settingsDataStore.edit { prefs ->
+            val current = prefs[homeNetworkBindingKey]
+                ?.let(KeystoreCrypto::decrypt)
+                ?.let(HomeNetworkBindingCodec::decode)
+            if (current == expected) {
+                prefs[homeNetworkBindingKey] = wrapped
+                prefs.remove(lastDeviceNameKey)
+                prefs.remove(lastDeviceHostKey)
+                prefs.remove(lastDevicePortKey)
+                replaced = true
+            }
+        }
+        return replaced
+    }
+
     suspend fun clearHomeNetworkBindingIf(name: String) {
         appContext.settingsDataStore.edit { prefs ->
             val bindingName = prefs[homeNetworkBindingKey]

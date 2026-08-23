@@ -1,6 +1,10 @@
 package dev.companionremote.app.quick
 
-internal const val HOME_NETWORK_DEPARTURE_GRACE_MS = 2_000L
+// A single NetworkCallback.onLost does not prove that Wi-Fi was disabled. In
+// particular, Samsung may replace the Android Network during roaming or link
+// reconfiguration while the phone remains on the same LAN. Keep a bounded
+// transition window for the successor Network and HAP continuity check.
+internal const val HOME_NETWORK_DEPARTURE_GRACE_MS = 15_000L
 internal const val HOME_NETWORK_WATCHER_TIMEOUT_MS = 5 * 60_000L
 
 /**
