@@ -14,6 +14,8 @@ object LockScreenRemotePolicy {
         QuickRemoteAction.Play,
         QuickRemoteAction.Pause,
         QuickRemoteAction.PlayPause,
+        QuickRemoteAction.SkipBack15,
+        QuickRemoteAction.SkipForward15,
         QuickRemoteAction.VolumeUp,
         QuickRemoteAction.VolumeDown,
     )

@@ -38,6 +38,8 @@ class LockScreenRemotePolicyTest {
             QuickRemoteAction.Play,
             QuickRemoteAction.Pause,
             QuickRemoteAction.PlayPause,
+            QuickRemoteAction.SkipBack15,
+            QuickRemoteAction.SkipForward15,
             QuickRemoteAction.VolumeUp,
             QuickRemoteAction.VolumeDown,
         )
@@ -49,7 +51,7 @@ class LockScreenRemotePolicyTest {
     }
 
     @Test
-    fun `locked input is rate limited and play pause is debounced`() {
+    fun `play pause is debounced while seek only throttles repeated direction`() {
         var now = 0L
         val limiter = LockedRemoteRateLimiter { now }
 
@@ -58,14 +60,38 @@ class LockScreenRemotePolicyTest {
         assertFalse(limiter.tryAcquire(QuickRemoteAction.Play))
         now = 351L
         assertTrue(limiter.tryAcquire(QuickRemoteAction.Pause))
+        now = 400L
+        assertTrue(limiter.tryAcquire(QuickRemoteAction.SkipForward15))
+        now = 450L
+        assertFalse(limiter.tryAcquire(QuickRemoteAction.SkipForward15))
+        now = 510L
+        assertTrue(limiter.tryAcquire(QuickRemoteAction.SkipForward15))
+        now = 520L
+        assertTrue(limiter.tryAcquire(QuickRemoteAction.SkipBack15))
+    }
 
-        repeat(6) { index ->
-            now = 400L + index * 115L
-            assertTrue(limiter.tryAcquire(QuickRemoteAction.entries[index]))
+    @Test
+    fun `locked input caps an action burst`() {
+        var now = 0L
+        val limiter = LockedRemoteRateLimiter { now }
+        val actions = listOf(
+            QuickRemoteAction.Up,
+            QuickRemoteAction.Down,
+            QuickRemoteAction.Left,
+            QuickRemoteAction.Right,
+            QuickRemoteAction.Select,
+            QuickRemoteAction.Back,
+            QuickRemoteAction.VolumeUp,
+            QuickRemoteAction.VolumeDown,
+        )
+
+        actions.forEachIndexed { index, action ->
+            now = index * 115L
+            assertTrue(limiter.tryAcquire(action), action.name)
         }
-        now = 990L
-        assertFalse(limiter.tryAcquire(QuickRemoteAction.VolumeUp))
-        now = 1_001L
-        assertTrue(limiter.tryAcquire(QuickRemoteAction.VolumeUp))
+        now = 900L
+        assertFalse(limiter.tryAcquire(QuickRemoteAction.SkipBack15))
+        now = 1_000L
+        assertTrue(limiter.tryAcquire(QuickRemoteAction.SkipBack15))
     }
 }

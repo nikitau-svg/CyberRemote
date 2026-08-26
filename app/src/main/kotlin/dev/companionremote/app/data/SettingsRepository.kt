@@ -22,6 +22,13 @@ enum class AppSkin { Midnight, Graphite, Aurora, Sunset }
 /** Haptic (vibration) strength for button feedback. */
 enum class HapticStrength { Light, Medium, Strong }
 
+internal const val LOCK_SCREEN_CONTROLS_POLICY_VERSION = 2
+
+internal fun hasCurrentLockScreenControlsConsent(
+    enabled: Boolean?,
+    policyVersion: Int?,
+): Boolean = enabled == true && policyVersion == LOCK_SCREEN_CONTROLS_POLICY_VERSION
+
 /** Persists app-level preferences (language, theme, skin, haptics, …). */
 class SettingsRepository(context: Context) {
 
@@ -34,6 +41,7 @@ class SettingsRepository(context: Context) {
     private val hapticStrengthKey = stringPreferencesKey("haptic_strength")
     private val introSeenKey = booleanPreferencesKey("intro_seen")
     private val lockScreenControlsKey = booleanPreferencesKey("lock_screen_controls")
+    private val lockScreenControlsPolicyVersionKey = intPreferencesKey("lock_screen_controls_policy_version")
     private val homeNetworkBindingKey = stringPreferencesKey("home_network_binding_v1")
 
     // Removed once a secure home binding is written. They are intentionally
@@ -92,7 +100,10 @@ class SettingsRepository(context: Context) {
 
     /** Explicit opt-in for a small, non-destructive command set on keyguard. */
     val lockScreenControls: Flow<Boolean> = appContext.settingsDataStore.data.map { prefs ->
-        prefs[lockScreenControlsKey] ?: false
+        hasCurrentLockScreenControlsConsent(
+            prefs[lockScreenControlsKey],
+            prefs[lockScreenControlsPolicyVersionKey],
+        )
     }
 
     suspend fun setLanguage(language: AppLanguage) {
@@ -149,7 +160,10 @@ class SettingsRepository(context: Context) {
     }
 
     suspend fun setLockScreenControls(enabled: Boolean) {
-        appContext.settingsDataStore.edit { prefs -> prefs[lockScreenControlsKey] = enabled }
+        appContext.settingsDataStore.edit { prefs ->
+            prefs[lockScreenControlsKey] = enabled
+            prefs[lockScreenControlsPolicyVersionKey] = LOCK_SCREEN_CONTROLS_POLICY_VERSION
+        }
     }
 
     /** Encrypted endpoint plus keyed LAN/device fingerprints. */

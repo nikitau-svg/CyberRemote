@@ -27,6 +27,7 @@ import dev.companionremote.protocol.client.CompanionClient
 import dev.companionremote.protocol.client.CompanionPlaybackState
 import dev.companionremote.protocol.client.KeyboardFocusState
 import dev.companionremote.protocol.client.TouchPhase
+import dev.companionremote.protocol.companion.CompanionCommandException
 import dev.companionremote.protocol.companion.CompanionConnection
 import dev.companionremote.protocol.hap.HapCredentials
 import dev.companionremote.protocol.hap.PairVerify
@@ -459,6 +460,19 @@ class RemoteSessionManager private constructor(context: Context) {
                 false
             } catch (e: CancellationException) {
                 throw e
+            } catch (e: CompanionCommandException) {
+                // The connection is still healthy: Apple TV explicitly
+                // rejected this command (for example, seek during live TV).
+                // Treat that as an unsupported action instead of tearing down
+                // the whole remote session.
+                Diagnostics.record(
+                    appContext,
+                    "remote_session",
+                    "command_rejected",
+                    "has_code" to (e.errorCode != null),
+                    "code" to e.errorCode,
+                )
+                false
             } catch (e: Exception) {
                 closeLocked()
                 _connectionError.value = friendlyError(e)

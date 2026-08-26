@@ -14,8 +14,8 @@ android {
         applicationId = "dev.companionremote.nikita"
         minSdk = 26
         targetSdk = 35
-        versionCode = 15
-        versionName = "1.3.7-network-handover"
+        versionCode = 16
+        versionName = "1.3.8-media-controls"
     }
 
     buildTypes {

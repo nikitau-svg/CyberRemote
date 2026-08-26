@@ -419,6 +419,8 @@ class RemoteControlService : Service() {
                 override fun onCustomAction(action: String, extras: Bundle?) {
                     if (!isControlLeaseActive(leaseToken)) return
                     when (action) {
+                        MEDIA_SKIP_BACK_15 -> enqueueAction(QuickRemoteAction.SkipBack15)
+                        MEDIA_SKIP_FORWARD_15 -> enqueueAction(QuickRemoteAction.SkipForward15)
                         MEDIA_VOLUME_DOWN -> enqueueAction(QuickRemoteAction.VolumeDown)
                         MEDIA_VOLUME_UP -> enqueueAction(QuickRemoteAction.VolumeUp)
                     }
@@ -1387,6 +1389,19 @@ class RemoteControlService : Service() {
                         PlaybackState.ACTION_PAUSE or
                         PlaybackState.ACTION_PLAY_PAUSE,
                 )
+                // Android 13+ gives the first two custom actions the compact
+                // back/forward slots. Keep relative seek ahead of volume so
+                // both 15-second controls remain visible on the lock screen.
+                .addCustomAction(
+                    MEDIA_SKIP_BACK_15,
+                    "Back 15 seconds",
+                    R.drawable.ic_skip_back_15,
+                )
+                .addCustomAction(
+                    MEDIA_SKIP_FORWARD_15,
+                    "Forward 15 seconds",
+                    R.drawable.ic_skip_forward_15,
+                )
                 .addCustomAction(MEDIA_VOLUME_DOWN, "Volume down", R.drawable.ic_volume_down)
                 .addCustomAction(MEDIA_VOLUME_UP, "Volume up", R.drawable.ic_volume_up)
                 .setState(
@@ -1706,6 +1721,8 @@ class RemoteControlService : Service() {
         private const val COMMAND_QUEUE_CAPACITY = 32
         private const val LOCKED_COMMAND_MAX_AGE_MS = 1_000L
         private const val UNLOCKED_COMMAND_MAX_AGE_MS = 3_000L
+        private const val MEDIA_SKIP_BACK_15 = "dev.companionremote.media.SKIP_BACK_15"
+        private const val MEDIA_SKIP_FORWARD_15 = "dev.companionremote.media.SKIP_FORWARD_15"
         private const val MEDIA_VOLUME_DOWN = "dev.companionremote.media.VOLUME_DOWN"
         private const val MEDIA_VOLUME_UP = "dev.companionremote.media.VOLUME_UP"
         private const val ARTWORK_EDGE_PX = 512
@@ -2024,8 +2041,8 @@ private object RemoteNotification {
             )
             .addAction(
                 commandAction(
-                    context, R.drawable.ic_volume_down, "Volume down",
-                    QuickRemoteAction.VolumeDown, 110, !controlsUnlocked, capabilityToken,
+                    context, R.drawable.ic_skip_back_15, "Back 15 seconds",
+                    QuickRemoteAction.SkipBack15, 110, !controlsUnlocked, capabilityToken,
                 ),
             )
             .addAction(
@@ -2040,8 +2057,8 @@ private object RemoteNotification {
             )
             .addAction(
                 commandAction(
-                    context, R.drawable.ic_volume_up, "Volume up",
-                    QuickRemoteAction.VolumeUp, 112, !controlsUnlocked, capabilityToken,
+                    context, R.drawable.ic_skip_forward_15, "Forward 15 seconds",
+                    QuickRemoteAction.SkipForward15, 112, !controlsUnlocked, capabilityToken,
                 ),
             )
             .addAction(

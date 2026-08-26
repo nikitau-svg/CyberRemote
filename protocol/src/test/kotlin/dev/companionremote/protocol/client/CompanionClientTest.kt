@@ -137,6 +137,36 @@ class CompanionClientTest {
     }
 
     @Test
+    fun `relative skip sends floating point seconds in both directions`() =
+        runWithClient({ null }) { client, atv ->
+            atv.requestLog.clear()
+
+            client.skipBy(-15.0)
+            client.skipBy(15.0)
+
+            @Suppress("UNCHECKED_CAST")
+            val commands = atv.requestLog
+                .filter { it["_i"] == "_mcc" }
+                .map { it["_c"] as Map<Any?, Any?> }
+            assertEquals(2, commands.size)
+            assertEquals(
+                listOf(MediaControlCommand.SkipBy.code, MediaControlCommand.SkipBy.code),
+                commands.map { it["_mcc"] },
+            )
+            assertEquals(listOf(-15.0, 15.0), commands.map { it["_skpS"] })
+        }
+
+    @Test
+    fun `relative skip rejects zero and non-finite intervals`() =
+        runWithClient({ null }) { client, _ ->
+            listOf(0.0, Double.NaN, Double.POSITIVE_INFINITY, Double.NEGATIVE_INFINITY)
+                .forEach { seconds ->
+                    val failure = runCatching { client.skipBy(seconds) }.exceptionOrNull()
+                    assertTrue(failure is IllegalArgumentException, seconds.toString())
+                }
+        }
+
+    @Test
     fun `now playing refresh sends exactly one fire-and-forget fetch event`() =
         runWithClient({ null }) { client, atv ->
             atv.eventLog.clear()

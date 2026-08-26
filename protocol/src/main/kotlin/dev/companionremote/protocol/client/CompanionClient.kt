@@ -424,6 +424,16 @@ class CompanionClient(
         mediaControl(MediaControlCommand.Pause)
     }
 
+    /** Seek relative to the current playback position by [seconds]. */
+    suspend fun skipBy(seconds: Double) {
+        require(seconds.isFinite() && seconds != 0.0) {
+            "skip interval must be a finite non-zero number of seconds"
+        }
+        // Companion OPACK cannot encode negative integers. Keep this value a
+        // floating point number so rewinding is encoded exactly like pyatv.
+        mediaControl(MediaControlCommand.SkipBy, mapOf("_skpS" to seconds))
+    }
+
     /**
      * Ask an already-connected Apple TV to push its current Now Playing state.
      *

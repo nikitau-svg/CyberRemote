@@ -276,7 +276,7 @@ fun SettingsScreen(viewModel: AppViewModel) {
                             fontWeight = FontWeight.Medium,
                         )
                         Text(
-                            "Allows navigation, Play/Pause and volume. Back, OK, Home and power still require unlock.",
+                            "Allows navigation, Play/Pause, 15-second seek and volume. Back, OK, Home and power still require unlock.",
                             style = MaterialTheme.typography.bodySmall,
                             color = MaterialTheme.colorScheme.onSurfaceVariant,
                         )

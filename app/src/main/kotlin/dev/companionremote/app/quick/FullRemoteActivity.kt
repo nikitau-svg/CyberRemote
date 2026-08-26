@@ -5,6 +5,7 @@ import android.content.Intent
 import android.graphics.Color as AndroidColor
 import android.os.Build
 import android.os.Bundle
+import android.view.KeyEvent
 import android.view.WindowManager
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
@@ -102,6 +103,7 @@ class FullRemoteActivity : ComponentActivity() {
     private var launchCapabilityRequired = false
     private var launchCapability: String? = null
     private var keyguardMonitorJob: Job? = null
+    private val hardwareVolumeKeyRouter = HardwareVolumeKeyRouter()
     @Volatile private var acceptingActivityCommands = false
     @Volatile private var activityEpoch = 0L
 
@@ -243,6 +245,47 @@ class FullRemoteActivity : ComponentActivity() {
         Diagnostics.record(this, "full_remote", "destroyed")
         invalidateActivityLease()
         super.onDestroy()
+    }
+
+    override fun onWindowFocusChanged(hasFocus: Boolean) {
+        super.onWindowFocusChanged(hasFocus)
+        if (!hasFocus) hardwareVolumeKeyRouter.reset()
+    }
+
+    override fun dispatchKeyEvent(event: KeyEvent): Boolean {
+        val key = when (event.keyCode) {
+            KeyEvent.KEYCODE_VOLUME_UP -> HardwareVolumeKey.Up
+            KeyEvent.KEYCODE_VOLUME_DOWN -> HardwareVolumeKey.Down
+            else -> return super.dispatchKeyEvent(event)
+        }
+        val decision = when (event.action) {
+            KeyEvent.ACTION_DOWN -> hardwareVolumeKeyRouter.onDown(
+                key = key,
+                repeatCount = event.repeatCount,
+                eventTimeMs = event.eventTime,
+                eligible = canRouteHardwareVolumeKeys(),
+            )
+            KeyEvent.ACTION_UP -> hardwareVolumeKeyRouter.onUp(key)
+            else -> HardwareVolumeKeyDecision(consumed = false, dispatch = false)
+        }
+        if (decision.dispatch) {
+            dispatch(
+                when (key) {
+                    HardwareVolumeKey.Up -> QuickRemoteAction.VolumeUp
+                    HardwareVolumeKey.Down -> QuickRemoteAction.VolumeDown
+                },
+            )
+        }
+        return if (decision.consumed) true else super.dispatchKeyEvent(event)
+    }
+
+    private fun canRouteHardwareVolumeKeys(): Boolean {
+        if (!::session.isInitialized || !::keyguard.isInitialized) return false
+        if (isFinishing || isDestroyed || !hasWindowFocus()) return false
+        if (!lifecycle.currentState.isAtLeast(Lifecycle.State.RESUMED)) return false
+        if (!isActivityLeaseValid(currentActivityLease())) return false
+        if (session.connectionState.value != ConnectionState.Connected) return false
+        return !keyguard.isKeyguardLocked || lockScreenControls.value == true
     }
 
     private fun connectUnlocked() {
@@ -408,6 +451,7 @@ class FullRemoteActivity : ComponentActivity() {
             (!lease.capabilityRequired || RemoteControlLeaseRegistry.isActive(lease.capability))
 
     private fun invalidateActivityLease() {
+        hardwareVolumeKeyRouter.reset()
         acceptingActivityCommands = false
         activityEpoch += 1L
         unlockRequestGeneration += 1L

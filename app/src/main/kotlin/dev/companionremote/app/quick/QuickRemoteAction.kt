@@ -16,6 +16,8 @@ enum class QuickRemoteAction(val wireValue: String) {
     Play("play"),
     Pause("pause"),
     PlayPause("play_pause"),
+    SkipBack15("skip_back_15"),
+    SkipForward15("skip_forward_15"),
     VolumeUp("volume_up"),
     VolumeDown("volume_down"),
     Wake("wake"),
@@ -47,6 +49,8 @@ enum class QuickRemoteAction(val wireValue: String) {
             Play -> client.play()
             Pause -> client.pause()
             PlayPause -> client.pressButton(HidCommand.PlayPause)
+            SkipBack15 -> client.skipBy(-SKIP_INTERVAL_SECONDS)
+            SkipForward15 -> client.skipBy(SKIP_INTERVAL_SECONDS)
             VolumeUp -> client.pressButton(HidCommand.VolumeUp)
             VolumeDown -> client.pressButton(HidCommand.VolumeDown)
             Wake -> client.wake()
@@ -55,6 +59,8 @@ enum class QuickRemoteAction(val wireValue: String) {
     }
 
     companion object {
+        private const val SKIP_INTERVAL_SECONDS = 15.0
+
         fun fromWireValue(value: String?): QuickRemoteAction? =
             entries.firstOrNull { it.wireValue == value }
     }
